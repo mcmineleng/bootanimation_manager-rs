@@ -1,0 +1,1 @@
+{"name":"bootanimation-manager","dependencies":{"kernelsu":"^3.3.0"},"devDependencies":{"parcel":"^2.16.4","parcel-namer-rewrite":"^2.16.4"},"parcel-namer-rewrite":{"rules":{"(.*)\\.js":"bundle.js"}}}

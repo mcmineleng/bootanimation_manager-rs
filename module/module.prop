@@ -1,0 +1,6 @@
+id=bootanimation_manager
+name=开机动画管理器
+version=1.0
+versionCode=1
+author=mineleng
+description=管理开机动画：选择已安装的动画，或从文件系统中选择 zip 安装新的动画。
