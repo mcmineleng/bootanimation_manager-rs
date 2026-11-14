@@ -1,7 +1,6 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -306,7 +305,7 @@ fn file_sha256(path: &str) -> Result<Option<String>, String> {
 // ============================================================
 fn parse_proc_mounts() -> Result<Vec<(String, String)>, String> {
     let content = fs::read_to_string("/proc/mounts")
-        .map_err(|_| "无法读取 /proc/mounts".into())?;
+        .map_err(|_| "无法读取 /proc/mounts".to_string())?;
     let mut mounts = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
