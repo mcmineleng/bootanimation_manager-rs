@@ -223,6 +223,20 @@ fn dark_animation_path(sys: &str) -> Option<String> {
 }
 
 // ============================================================
+// bind mount 封装（rustix mount 不接受 Option）
+// ============================================================
+fn bind_mount(src: &Path, dst: &Path) -> Result<(), String> {
+    mount(
+        src,
+        dst,
+        "",
+        MountFlags::BIND,
+        "",
+    )
+    .map_err(|e| format!("mount 失败 {} -> {}: {:?}", src.display(), dst.display(), e))
+}
+
+// ============================================================
 // 动画枚举 / 校验
 // ============================================================
 /// 扫描 bootanimations/，只返回含合法 info.json 的动画
@@ -597,34 +611,20 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         return Ok(());
     }
 
-    let zip_str = zip_path.to_string_lossy();
-    mount(
-        Some(Path::new(&*zip_str)),
-        Path::new(&sys),
-        None,
-        MountFlags::BIND,
-        None,
-    )
-    .map_err(|e| format!("mount 失败 {} -> {}: {:?}", zip_str, sys, e))?;
+    bind_mount(&zip_path, Path::new(&sys))?;
 
     let ok_main = match detect_lang() {
-        Lang::Zh => format!("已挂载: {} -> {}", zip_str, sys),
-        Lang::En => format!("mounted: {} -> {}", zip_str, sys),
+        Lang::Zh => format!("已挂载: {} -> {}", zip_path.display(), sys),
+        Lang::En => format!("mounted: {} -> {}", zip_path.display(), sys),
     };
     log_ok(flags, &ok_main);
 
     let mut dark_done = false;
     if let Some(dark) = dark_animation_path(&sys) {
-        if let Ok(()) = mount(
-            Some(Path::new(&*zip_str)),
-            Path::new(&dark),
-            None,
-            MountFlags::BIND,
-            None,
-        ) {
+        if bind_mount(&zip_path, Path::new(&dark)).is_ok() {
             let ok_dark = match detect_lang() {
-                Lang::Zh => format!("已挂载 dark: {} -> {}", zip_str, dark),
-                Lang::En => format!("mounted dark: {} -> {}", zip_str, dark),
+                Lang::Zh => format!("已挂载 dark: {} -> {}", zip_path.display(), dark),
+                Lang::En => format!("mounted dark: {} -> {}", zip_path.display(), dark),
             };
             log_ok(flags, &ok_dark);
             dark_done = true;
@@ -734,34 +734,20 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let zip_str = zip_path.to_string_lossy();
-    mount(
-        Some(Path::new(&*zip_str)),
-        Path::new(&sys),
-        None,
-        MountFlags::BIND,
-        None,
-    )
-    .map_err(|e| format!("mount 失败 {} -> {}: {:?}", zip_str, sys, e))?;
+    bind_mount(&zip_path, Path::new(&sys))?;
 
     let ok_main = match detect_lang() {
-        Lang::Zh => format!("已临时挂载: {} -> {}", zip_str, sys),
-        Lang::En => format!("temporarily mounted: {} -> {}", zip_str, sys),
+        Lang::Zh => format!("已临时挂载: {} -> {}", zip_path.display(), sys),
+        Lang::En => format!("temporarily mounted: {} -> {}", zip_path.display(), sys),
     };
     log_ok(flags, &ok_main);
 
     let mut dark_mounted = false;
     if let Some(dark) = dark_animation_path(&sys) {
-        if let Ok(()) = mount(
-            Some(Path::new(&*zip_str)),
-            Path::new(&dark),
-            None,
-            MountFlags::BIND,
-            None,
-        ) {
+        if bind_mount(&zip_path, Path::new(&dark)).is_ok() {
             let ok_dark = match detect_lang() {
-                Lang::Zh => format!("已临时挂载 dark: {} -> {}", zip_str, dark),
-                Lang::En => format!("temporarily mounted dark: {} -> {}", zip_str, dark),
+                Lang::Zh => format!("已临时挂载 dark: {} -> {}", zip_path.display(), dark),
+                Lang::En => format!("temporarily mounted dark: {} -> {}", zip_path.display(), dark),
             };
             log_ok(flags, &ok_dark);
             dark_mounted = true;
@@ -1514,35 +1500,23 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
         fs::copy(&info_path, target.join("info.json")).map_err(|e| e.to_string())?;
 
         if was_active {
-            let zip_str = out_zip.to_string_lossy();
             if let Some(sys) = detect_system_animation() {
                 if !is_mounted(&sys).unwrap_or(false) {
-                    let _ = mount(
-                        Some(Path::new(&*zip_str)),
-                        Path::new(&sys),
-                        None,
-                        MountFlags::BIND,
-                        None,
-                    );
-                    let ok = format!(
-                        "{}: {} -> {}",
-                        match detect_lang() {
-                            Lang::Zh => "已重新挂载",
-                            Lang::En => "remounted",
-                        },
-                        zip_str,
-                        sys
-                    );
-                    log_ok(flags, &ok);
-
-                    if let Some(dark) = dark_animation_path(&sys) {
-                        let _ = mount(
-                            Some(Path::new(&*zip_str)),
-                            Path::new(&dark),
-                            None,
-                            MountFlags::BIND,
-                            None,
+                    if bind_mount(&out_zip, Path::new(&sys)).is_ok() {
+                        let ok = format!(
+                            "{}: {} -> {}",
+                            match detect_lang() {
+                                Lang::Zh => "已重新挂载",
+                                Lang::En => "remounted",
+                            },
+                            out_zip.display(),
+                            sys
                         );
+                        log_ok(flags, &ok);
+
+                        if let Some(dark) = dark_animation_path(&sys) {
+                            let _ = bind_mount(&out_zip, Path::new(&dark));
+                        }
                     }
                 }
             }
