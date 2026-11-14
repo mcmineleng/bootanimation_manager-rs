@@ -1,0 +1,38 @@
+name: Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. 安装 Rust 工具链 (cargo, rustc)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 2. 安装 Clang (非 GCC)
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18" # 可根据需要指定具体版本，如 "17.0.6"
+
+      # 3. 安装 Android NDK
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c # 建议使用较新的 LTS 版本
+          add-to-path: false
+
+      # 4. 配置 ANDROID_NDK_HOME 环境变量
+      - name: Export ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      # 5. 在仓库根目录运行 make (默认目标)
+      - name: Run make
+        run: make
