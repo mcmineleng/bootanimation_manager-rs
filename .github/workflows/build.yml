@@ -10,17 +10,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. 安装 Rust 工具链 (cargo, rustc)
+      # 1. 安装 Rust 工具链 (cargo, rustc) + 交叉编译目标
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-linux-android
 
       # 2. 安装 Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '20'
 
       # 3. 在 webui/ 目录运行 npm install
       - name: Install npm dependencies
