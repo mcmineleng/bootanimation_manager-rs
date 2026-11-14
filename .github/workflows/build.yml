@@ -20,10 +20,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
-      # 3. 运行 npm install
+      # 3. 在 webui/ 目录运行 npm install
       - name: Install npm dependencies
+        working-directory: webui
         run: npm install
 
       # 4. 安装 Clang (非 GCC)
