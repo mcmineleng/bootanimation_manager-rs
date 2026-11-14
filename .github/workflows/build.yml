@@ -16,13 +16,23 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # 2. 安装 Clang (非 GCC)
+      # 2. 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3. 运行 npm install
+      - name: Install npm dependencies
+        run: npm install
+
+      # 4. 安装 Clang (非 GCC)
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "18"
 
-      # 3. 安装 Android NDK
+      # 5. 安装 Android NDK
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
@@ -30,10 +40,18 @@ jobs:
           ndk-version: r27c
           add-to-path: false
 
-      # 4. 配置 ANDROID_NDK_HOME 环境变量
+      # 6. 配置 ANDROID_NDK_HOME 环境变量
       - name: Export ANDROID_NDK_HOME
         run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
 
-      # 5. 在仓库根目录运行 make (默认目标)
+      # 7. 在仓库根目录运行 make (默认目标)
       - name: Run make
         run: make
+
+      # 8. 上传产物 package-arm64.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-arm64
+          path: package-arm64.zip
+          if-no-files-found: error
