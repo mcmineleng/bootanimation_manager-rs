@@ -40,7 +40,6 @@ enum Lang {
 }
 
 fn detect_lang() -> Lang {
-    // INFO_ENG 强制英文
     for var in &["INFO_ENG", "INFO_EN"] {
         if let Ok(val) = env::var(var) {
             let v = val.to_lowercase();
@@ -177,13 +176,11 @@ fn json_output<T: Serialize>(value: &T) -> Result<(), String> {
 // 路径工具
 // ============================================================
 fn mod_dir() -> PathBuf {
-    // 优先用外部传入的 MODDIR
     if let Ok(dir) = env::var("MODDIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    // fallback: 当前工作目录
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
@@ -223,6 +220,59 @@ fn detect_system_animation() -> Option<String> {
 fn dark_animation_path(sys: &str) -> Option<String> {
     let p = Path::new(sys).parent()?.join("bootanimation-dark.zip");
     p.exists().then(|| p.to_string_lossy().into_owned())
+}
+
+// ============================================================
+// 动画枚举 / 校验
+// ============================================================
+/// 扫描 bootanimations/，只返回含合法 info.json 的动画
+/// 返回 (id, info_json_value)，按 id 字典序
+fn scan_animations(moddir: &Path) -> Vec<(String, serde_json::Value)> {
+    let dir = moddir.join(ANIM_DIR);
+    let mut out = Vec::new();
+    let rd = match fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let id = p.file_name().unwrap().to_string_lossy().into_owned();
+        let info_path = p.join("info.json");
+        let val = match fs::read_to_string(&info_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        out.push((id, val));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// 判断某个 id 是否是合法动画：
+/// 目录存在 + info.json 可解析且 id 一致 + bootanimation.zip 存在
+fn is_valid_animation(moddir: &Path, id: &str) -> bool {
+    let base = moddir.join(ANIM_DIR).join(id);
+    if !base.is_dir() {
+        return false;
+    }
+    if !base.join("bootanimation.zip").is_file() {
+        return false;
+    }
+    fs::read_to_string(base.join("info.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == id)
+        })
+        .unwrap_or(false)
 }
 
 // ============================================================
@@ -268,7 +318,7 @@ fn mounted_sources(target: &str) -> Result<Vec<String>, String> {
     let target = if let Ok(c) = fs::canonicalize(target) {
         c
     } else {
-        return Ok(vec);
+        return Ok(vec![]);
     };
     let target = target.to_string_lossy();
     Ok(parse_proc_mounts()?
@@ -343,6 +393,118 @@ struct InstallData {
     message: String,
 }
 
+#[derive(Serialize)]
+struct ListItem {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ListData {
+    animations: Vec<ListItem>,
+}
+
+#[derive(Serialize)]
+struct InfoData {
+    info: Vec<serde_json::Value>,
+}
+
+// ============================================================
+// list
+// ============================================================
+fn list_cmd(flags: &GlobalFlags) -> Result<(), String> {
+    let moddir = mod_dir();
+    let anims = scan_animations(&moddir);
+
+    let items: Vec<ListItem> = anims
+        .iter()
+        .map(|(id, v)| ListItem {
+            id: id.clone(),
+            name: v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or(id)
+                .to_string(),
+        })
+        .collect();
+
+    if flags.json {
+        json_output(&CmdResult {
+            success: true,
+            data: Some(ListData {
+                animations: items,
+            }),
+            error: None,
+        })?;
+    } else if items.is_empty() {
+        log_info(
+            flags,
+            match detect_lang() {
+                Lang::Zh => "没有已安装的动画",
+                Lang::En => "no animations installed",
+            },
+        );
+    } else {
+        for it in &items {
+            eprintln!("{}\t{}", it.id, it.name);
+        }
+    }
+    Ok(())
+}
+
+// ============================================================
+// info
+// ============================================================
+fn info_cmd(flags: &GlobalFlags, ids: &[String]) -> Result<(), String> {
+    let moddir = mod_dir();
+    let all = scan_animations(&moddir);
+
+    let selected: Vec<serde_json::Value> = if ids.is_empty() {
+        all.into_iter().map(|(_, v)| v).collect()
+    } else {
+        let mut v = Vec::new();
+        for want in ids {
+            match all.iter().find(|(id, _)| id == want) {
+                Some((_, info)) => v.push(info.clone()),
+                None => {
+                    let w = format!(
+                        "{}: {}",
+                        match detect_lang() {
+                            Lang::Zh => "未找到动画",
+                            Lang::En => "animation not found",
+                        },
+                        want
+                    );
+                    log_warn(flags, &w);
+                }
+            }
+        }
+        v
+    };
+
+    if flags.json {
+        json_output(&CmdResult {
+            success: true,
+            data: Some(InfoData { info: selected }),
+            error: None,
+        })?;
+    } else if selected.is_empty() {
+        log_info(
+            flags,
+            match detect_lang() {
+                Lang::Zh => "没有匹配的动画",
+                Lang::En => "no matching animations",
+            },
+        );
+    } else {
+        for v in &selected {
+            let s = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+            eprintln!("{}", s);
+        }
+    }
+    Ok(())
+}
+
 // ============================================================
 // apply
 // ============================================================
@@ -353,8 +515,8 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         Some(id) => id,
         None => {
             let msg = match detect_lang() {
-                Lang::Zh => "bootanimation.txt 为空，跳过".into(),
-                Lang::En => "bootanimation.txt is empty, skipping".into(),
+                Lang::Zh => "bootanimation.txt 为空，跳过".to_string(),
+                Lang::En => "bootanimation.txt is empty, skipping".to_string(),
             };
             log_warn(flags, &msg);
             if flags.json {
@@ -368,15 +530,14 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         }
     };
 
-    let zip_path = animation_zip(&moddir, &id);
-    if !zip_path.exists() {
+    if !is_valid_animation(&moddir, &id) {
         let msg = format!(
             "{}: {}",
             match detect_lang() {
-                Lang::Zh => "动画不存在",
-                Lang::En => "animation not found",
+                Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
+                Lang::En => "invalid animation (missing info.json or incomplete)",
             },
-            zip_path.display()
+            id
         );
         log_error(flags, &msg);
         if flags.json {
@@ -391,6 +552,8 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         }
         return Ok(());
     }
+
+    let zip_path = animation_zip(&moddir, &id);
 
     let sys = match detect_system_animation() {
         Some(s) => s,
@@ -504,16 +667,15 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
 // ============================================================
 fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
-    let zip_path = animation_zip(&moddir, id);
 
-    if !zip_path.exists() {
+    if !is_valid_animation(&moddir, id) {
         let msg = format!(
             "{}: {}",
             match detect_lang() {
-                Lang::Zh => "动画不存在",
-                Lang::En => "animation not found",
+                Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
+                Lang::En => "invalid animation (missing info.json or incomplete)",
             },
-            zip_path.display()
+            id
         );
         log_error(flags, &msg);
         if flags.json {
@@ -525,6 +687,8 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
         }
         return Ok(());
     }
+
+    let zip_path = animation_zip(&moddir, id);
 
     let sys = match detect_system_animation() {
         Some(s) => s,
@@ -970,16 +1134,15 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
 // ============================================================
 fn use_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
-    let zip_path = animation_zip(&moddir, id);
 
-    if !zip_path.exists() {
+    if !is_valid_animation(&moddir, id) {
         let msg = format!(
             "{}: {}",
             match detect_lang() {
-                Lang::Zh => "动画不存在",
-                Lang::En => "animation not found",
+                Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
+                Lang::En => "invalid animation (missing info.json or incomplete)",
             },
-            zip_path.display()
+            id
         );
         log_error(flags, &msg);
         if flags.json {
@@ -1508,6 +1671,8 @@ fn print_help(prog: &str) {
   check                      {check_zh}
   use <id>                   {use_zh}
   install <zip>              {install_zh}
+  list                       {list_zh}
+  info [id...]               {info_zh}
   help                       {help_zh}
 
 {opt}:
@@ -1547,6 +1712,14 @@ fn print_help(prog: &str) {
         install_zh = match detect_lang() {
             Lang::Zh => "安装动画包",
             Lang::En => "install animation package",
+        },
+        list_zh = match detect_lang() {
+            Lang::Zh => "列出所有动画的 ID 和名称",
+            Lang::En => "list all animation IDs and names",
+        },
+        info_zh = match detect_lang() {
+            Lang::Zh => "列出动画完整信息（可指定一个或多个 ID）",
+            Lang::En => "show full animation info (optionally filter by one or more IDs)",
         },
         help_zh = match detect_lang() {
             Lang::Zh => "显示帮助",
@@ -1626,6 +1799,8 @@ fn main() {
                 })
             }
         }
+        Some("list") => list_cmd(&flags),
+        Some("info") => info_cmd(&flags, sub),
         Some("help") | Some("--help") | Some("-h") => {
             print_help(&prog);
             exit(0);
