@@ -49,6 +49,9 @@ jobs:
       # 7. 在仓库根目录运行 make (默认目标)
       - name: Run make
         run: make
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
 
       # 8. 上传产物 package-arm64.zip
       - name: Upload artifact
