@@ -1,10 +1,11 @@
-PARCEL := npx parcel
+NPM_RUN := npm run
 DIST   := outputs
 
 .PHONY: build clean
 
 build:
-	$(PARCEL) build src/index.html --dist-dir $(DIST) --public-url ./
+	$(NPM_RUN) build
+	rm outputs/*.map
 
 clean:
 	rm -rf .parcel-cache $(DIST)
