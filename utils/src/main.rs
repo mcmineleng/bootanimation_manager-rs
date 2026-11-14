@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use hex::encode as hex_encode;
-use rustix::mount::{mount, umount, MountFlags};
+use rustix::mount::{mount, unmount, MountFlags, UnmountFlags};
 use sha2::{Digest, Sha256};
 use zip as zip_crate;
 
@@ -226,14 +226,13 @@ fn dark_animation_path(sys: &str) -> Option<String> {
 // bind mount 封装（rustix mount 不接受 Option）
 // ============================================================
 fn bind_mount(src: &Path, dst: &Path) -> Result<(), String> {
-    mount(
-        src,
-        dst,
-        "",
-        MountFlags::BIND,
-        "",
-    )
-    .map_err(|e| format!("mount 失败 {} -> {}: {:?}", src.display(), dst.display(), e))
+    mount(src, dst, "", MountFlags::BIND, "")
+        .map_err(|e| format!("mount 失败 {} -> {}: {:?}", src.display(), dst.display(), e))
+}
+
+fn bind_unmount(dst: &Path) -> Result<(), String> {
+    unmount(dst, UnmountFlags::empty())
+        .map_err(|e| format!("unmount 失败 {}: {:?}", dst.display(), e))
 }
 
 // ============================================================
@@ -324,8 +323,8 @@ fn is_mounted(target: &str) -> Result<bool, String> {
     } else {
         return Ok(false);
     };
-    let target = target.to_string_lossy();
-    Ok(parse_proc_mounts()?.iter().any(|(_, m)| m == target))
+    let target = target.to_string_lossy().into_owned();
+    Ok(parse_proc_mounts()?.iter().any(|(_, m)| m == &target))
 }
 
 fn mounted_sources(target: &str) -> Result<Vec<String>, String> {
@@ -334,10 +333,10 @@ fn mounted_sources(target: &str) -> Result<Vec<String>, String> {
     } else {
         return Ok(vec![]);
     };
-    let target = target.to_string_lossy();
+    let target = target.to_string_lossy().into_owned();
     Ok(parse_proc_mounts()?
         .iter()
-        .filter_map(|(s, m)| if m == target { Some(s.clone()) } else { None })
+        .filter_map(|(s, m)| if m == &target { Some(s.clone()) } else { None })
         .collect())
 }
 
@@ -817,8 +816,7 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
     let mut unmounted = Vec::new();
 
     if is_mounted(&sys)? {
-        umount(Path::new(&sys))
-            .map_err(|e| format!("umount 失败 {}: {:?}", sys, e))?;
+        bind_unmount(Path::new(&sys))?;
         let ok_msg = match detect_lang() {
             Lang::Zh => format!("已卸载: {}", sys),
             Lang::En => format!("unmounted: {}", sys),
@@ -829,7 +827,7 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
 
     if let Some(dark) = dark_animation_path(&sys) {
         if is_mounted(&dark)? {
-            let _ = umount(Path::new(&dark));
+            let _ = bind_unmount(Path::new(&dark));
             let ok_msg = match detect_lang() {
                 Lang::Zh => format!("已卸载: {}", dark),
                 Lang::En => format!("unmounted: {}", dark),
@@ -1452,7 +1450,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
                     was_active = true;
                     if let Some(sys) = detect_system_animation() {
                         if is_mounted(&sys).unwrap_or(false) {
-                            let _ = umount(Path::new(&sys));
+                            let _ = bind_unmount(Path::new(&sys));
                             let ok = format!(
                                 "{}: {}",
                                 match detect_lang() {
@@ -1465,7 +1463,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
                         }
                         if let Some(dark) = dark_animation_path(&sys) {
                             if is_mounted(&dark).unwrap_or(false) {
-                                let _ = umount(Path::new(&dark));
+                                let _ = bind_unmount(Path::new(&dark));
                             }
                         }
                     }
