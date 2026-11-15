@@ -93,9 +93,6 @@ fn write_settings(moddir: &Path, settings: &Settings) -> Result<(), String> {
 //   2. INFO_ENG / INFO_EN 环境变量
 //   3. LANG / LC_ALL / LC_MESSAGES / LANGUAGE
 //   4. 默认 En
-//
-// 用 OnceLock 缓存，避免每次 log 都读文件；
-// 直接读文件而不经过 read_settings，避免解析失败时 log 递归。
 // ============================================================
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang {
@@ -344,6 +341,7 @@ fn bind_unmount(dst: &Path) -> Result<(), String> {
 }
 
 /// 强制卸载目标路径上的所有挂载层
+/// 注意：rustix 0.38+ 中 lazy detach 常量名为 `DETACH`（旧版叫 `MNT_DETACH`）
 fn force_unmount_all(target: &str) {
     let p = Path::new(target);
     for _ in 0..8 {
@@ -351,7 +349,7 @@ fn force_unmount_all(target: &str) {
             return;
         }
         if unmount(p, UnmountFlags::empty()).is_err() {
-            if unmount(p, UnmountFlags::MNT_DETACH).is_err() {
+            if unmount(p, UnmountFlags::DETACH).is_err() {
                 return;
             }
         }
