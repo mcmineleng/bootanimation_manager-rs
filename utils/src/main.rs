@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::OnceLock;
@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 // ============================================================
 // 常量
 // ============================================================
-const SETTINGS_JSON: &str = "settings.json";     // 持久化配置
-const ONCE_TXT: &str = "once_bootanimation";     // 一次性：下次 apply 用完即删
-const NOW_TXT: &str = "now_bootanimation";       // 当前实际应用的动画 ID
+const SETTINGS_JSON: &str = "settings.json";
+const ONCE_TXT: &str = "once_bootanimation";
+const NOW_TXT: &str = "now_bootanimation";
 
 const ANIM_DIR: &str = "bootanimations";
 
@@ -38,13 +38,10 @@ const COLOROS_CANDIDATES: &[&str] = &[
 // ============================================================
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
-    /// 默认动画 ID；None 表示未设置
     #[serde(default)]
     bootanimation: Option<String>,
-    /// false 时 apply（开机自动挂载）直接失败；once_apply / apply --temp 不受影响
     #[serde(default = "default_enable")]
     enable: bool,
-    /// 界面语言，最高优先级；"zh_CN" / "en_US" 等
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
 }
@@ -87,12 +84,6 @@ fn write_settings(moddir: &Path, settings: &Settings) -> Result<(), String> {
 
 // ============================================================
 // 语言检测
-//
-// 优先级：
-//   1. settings.json 的 language 字段（zh* → Zh，en* → En）
-//   2. INFO_ENG / INFO_EN 环境变量
-//   3. LANG / LC_ALL / LC_MESSAGES / LANGUAGE
-//   4. 默认 En
 // ============================================================
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang {
@@ -264,6 +255,11 @@ fn json_output<T: Serialize>(value: &T) -> Result<(), String> {
 
 // ============================================================
 // 路径 / ID 读取工具
+//
+// ⭐ 关键修复 1：mod_dir 找不到 MODDIR 时，从 current_exe 往上找模块根
+// 原因：post-fs-data.sh 里的 MODDIR 只是 shell 变量，子进程拿不到，
+//       而脚本 cwd 是 "/"，会导致所有路径指向 "/bootanimations/..."，
+//       apply 静默 fallback 到系统 AOSP 动画。
 // ============================================================
 fn mod_dir() -> PathBuf {
     if let Ok(dir) = env::var("MODDIR") {
@@ -271,10 +267,30 @@ fn mod_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
+
+    if let Ok(exe) = env::current_exe() {
+        let mut p: &Path = exe.as_path();
+        for _ in 0..5 {
+            if let Some(parent) = p.parent() {
+                if parent.join("module.prop").exists()
+                    || parent.join(ANIM_DIR).exists()
+                    || parent.join(SETTINGS_JSON).exists()
+                {
+                    return parent.to_path_buf();
+                }
+                p = parent;
+            } else {
+                break;
+            }
+        }
+        if let Some(parent) = exe.parent() {
+            return parent.to_path_buf();
+        }
+    }
+
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// 从任意 ID 文件中读第一个有效行（跳过空行和 # 注释）
 fn read_id_file(path: &Path) -> Result<Option<String>, String> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -289,12 +305,10 @@ fn read_id_file(path: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// 一次性动画（下次 apply 用完即删）
 fn read_once_id(moddir: &Path) -> Result<Option<String>, String> {
     read_id_file(&moddir.join(ONCE_TXT))
 }
 
-/// 当前实际应用的动画
 fn read_now_id(moddir: &Path) -> Result<Option<String>, String> {
     read_id_file(&moddir.join(NOW_TXT))
 }
@@ -303,7 +317,6 @@ fn animation_zip(moddir: &Path, id: &str) -> PathBuf {
     moddir.join(ANIM_DIR).join(id).join("bootanimation.zip")
 }
 
-/// 返回 (系统动画路径, 是否为 ColorOS 路径)
 fn detect_system_animation_ex() -> Option<(String, bool)> {
     for p in SYSTEM_CANDIDATES {
         if Path::new(p).exists() {
@@ -340,8 +353,6 @@ fn bind_unmount(dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("unmount 失败 {}: {:?}", dst.display(), e))
 }
 
-/// 强制卸载目标路径上的所有挂载层
-/// 注意：rustix 0.38+ 中 lazy detach 常量名为 `DETACH`（旧版叫 `MNT_DETACH`）
 fn force_unmount_all(target: &str) {
     let p = Path::new(target);
     for _ in 0..8 {
@@ -653,31 +664,23 @@ fn info_cmd(flags: &GlobalFlags, ids: &[String]) -> Result<(), String> {
 // ============================================================
 // apply
 //
-// enable=false → 返回 success:false，明确告知原因，不消费 once
+// ⭐ 关键修复 2：所有"失败"路径改为 return Err(...)，
+//   - 修复了"post-fs-data.sh 看到退出码 0 就以为成功"的问题
+//   - JSON 输出由 main 统一处理（success:false + error）
 // ============================================================
 fn apply(flags: &GlobalFlags) -> Result<(), String> {
     let moddir = mod_dir();
     let settings = read_settings(&moddir)?;
 
-    // 禁用状态下直接返回失败，不消费 once
     if !settings.enable {
-        let msg = match detect_lang() {
+        return Err(match detect_lang() {
             Lang::Zh => {
                 "开机自动生效已被关闭（settings.json: enable=false），跳过挂载".to_string()
             }
             Lang::En => {
                 "auto-mount is disabled (settings.json: enable=false), skipping mount".to_string()
             }
-        };
-        log_warn(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult::<ApplyData> {
-                success: false,
-                data: None,
-                error: Some(msg),
-            })?;
-        }
-        return Ok(());
+        });
     }
 
     let once_path = moddir.join(ONCE_TXT);
@@ -729,43 +732,17 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
                         Lang::En => "settings.bootanimation is empty, skipping".to_string(),
                     }
                 };
-                if boot_id.is_some() {
-                    log_error(flags, &msg);
-                } else {
-                    log_warn(flags, &msg);
-                }
-                if flags.json {
-                    json_output(&CmdResult::<ApplyData> {
-                        success: false,
-                        data: None,
-                        error: Some(msg),
-                    })?;
-                }
-                return Ok(());
+                return Err(msg);
             }
         }
     };
 
     let zip_path = animation_zip(&moddir, &id);
 
-    let sys = match detect_system_animation() {
-        Some(s) => s,
-        None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "未检测到系统开机动画路径",
-                Lang::En => "system boot animation path not found",
-            };
-            log_error(flags, msg);
-            if flags.json {
-                json_output(&CmdResult::<ApplyData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg.into()),
-                })?;
-            }
-            return Ok(());
-        }
-    };
+    let sys = detect_system_animation().ok_or_else(|| match detect_lang() {
+        Lang::Zh => "未检测到系统开机动画路径".to_string(),
+        Lang::En => "system boot animation path not found".to_string(),
+    })?;
 
     if is_mounted(&sys).unwrap_or(false) {
         force_unmount_all(&sys);
@@ -860,51 +837,28 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
 }
 
 // ============================================================
-// apply_temp（无状态，不受 enable 影响）
+// apply_temp（无状态）
 // ============================================================
 fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
 
     if !is_valid_animation(&moddir, id) {
-        let msg = format!(
+        return Err(format!(
             "{}: {}",
             match detect_lang() {
                 Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
                 Lang::En => "invalid animation (missing info.json or incomplete)",
             },
             id
-        );
-        log_error(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult::<ApplyTempData> {
-                success: false,
-                data: None,
-                error: Some(msg),
-            })?;
-        }
-        return Ok(());
+        ));
     }
 
     let zip_path = animation_zip(&moddir, id);
 
-    let sys = match detect_system_animation() {
-        Some(s) => s,
-        None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "未检测到系统开机动画路径",
-                Lang::En => "system boot animation path not found",
-            };
-            log_error(flags, msg);
-            if flags.json {
-                json_output(&CmdResult::<ApplyTempData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg.into()),
-                })?;
-            }
-            return Ok(());
-        }
-    };
+    let sys = detect_system_animation().ok_or_else(|| match detect_lang() {
+        Lang::Zh => "未检测到系统开机动画路径".to_string(),
+        Lang::En => "system boot animation path not found".to_string(),
+    })?;
 
     if is_mounted(&sys).unwrap_or(false) {
         force_unmount_all(&sys);
@@ -998,24 +952,10 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
 fn revert(flags: &GlobalFlags) -> Result<(), String> {
     let moddir = mod_dir();
 
-    let sys = match detect_system_animation() {
-        Some(s) => s,
-        None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "未检测到系统开机动画路径",
-                Lang::En => "system boot animation path not found",
-            };
-            log_error(flags, msg);
-            if flags.json {
-                json_output(&CmdResult::<RevertData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg.into()),
-                })?;
-            }
-            return Ok(());
-        }
-    };
+    let sys = detect_system_animation().ok_or_else(|| match detect_lang() {
+        Lang::Zh => "未检测到系统开机动画路径".to_string(),
+        Lang::En => "system boot animation path not found".to_string(),
+    })?;
 
     let mut unmounted = Vec::new();
 
@@ -1235,41 +1175,18 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
     let id = match effective_id {
         Some(id) => id,
         None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "没有可检查的动画（now_bootanimation 和 settings.bootanimation 都为空）",
-                Lang::En => "no animation to check (both now_bootanimation and settings.bootanimation are empty)",
-            };
-            log_warn(flags, msg);
-            if flags.json {
-                json_output(&CmdResult::<CheckData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg.into()),
-                })?;
-            }
-            return Ok(());
+            return Err(match detect_lang() {
+                Lang::Zh => "没有可检查的动画（now_bootanimation 和 settings.bootanimation 都为空）".into(),
+                Lang::En => "no animation to check (both now_bootanimation and settings.bootanimation are empty)".into(),
+            });
         }
     };
 
     let module_zip = animation_zip(&moddir, &id);
-    let sys = match detect_system_animation() {
-        Some(s) => s,
-        None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "未检测到系统开机动画路径",
-                Lang::En => "system boot animation path not found",
-            };
-            log_error(flags, msg);
-            if flags.json {
-                json_output(&CmdResult::<CheckData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg.into()),
-                })?;
-            }
-            return Ok(());
-        }
-    };
+    let sys = detect_system_animation().ok_or_else(|| match detect_lang() {
+        Lang::Zh => "未检测到系统开机动画路径".to_string(),
+        Lang::En => "system boot animation path not found".to_string(),
+    })?;
 
     let module_hash = file_sha256(module_zip.to_str().unwrap())?;
     let system_hash = file_sha256(&sys)?;
@@ -1425,23 +1342,14 @@ fn use_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
 
     if !is_valid_animation(&moddir, id) {
-        let msg = format!(
+        return Err(format!(
             "{}: {}",
             match detect_lang() {
                 Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
                 Lang::En => "invalid animation (missing info.json or incomplete)",
             },
             id
-        );
-        log_error(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult::<UseData> {
-                success: false,
-                data: None,
-                error: Some(msg),
-            })?;
-        }
-        return Ok(());
+        ));
     }
 
     let mut settings = read_settings(&moddir)?;
@@ -1479,23 +1387,14 @@ fn once_apply_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
 
     if !is_valid_animation(&moddir, id) {
-        let msg = format!(
+        return Err(format!(
             "{}: {}",
             match detect_lang() {
                 Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
                 Lang::En => "invalid animation (missing info.json or incomplete)",
             },
             id
-        );
-        log_error(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult::<UseData> {
-                success: false,
-                data: None,
-                error: Some(msg),
-            })?;
-        }
-        return Ok(());
+        ));
     }
 
     let path = moddir.join(ONCE_TXT);
@@ -1649,26 +1548,126 @@ fn detect_resolution() -> (u32, u32) {
     (1080, 2400)
 }
 
-fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
-    let fps = config.fps.unwrap_or(60);
-    let mut d = if coloros {
-        let ox = config.offset_x.unwrap_or(0);
-        let oy = config.offset_y.unwrap_or(0);
-        format!("g {} {} {} {} {}\n", w, h, ox, oy, fps)
-    } else {
-        format!("{} {} {}\n", w, h, fps)
-    };
-    for p in &config.part {
-        d.push_str(&format!(
-            "{} {} {} {}\n",
-            p.part_type.as_deref().unwrap_or("p"),
-            p.loop_count.unwrap_or(0),
-            p.pause.unwrap_or(0),
-            p.path
-        ));
+// ============================================================
+// ⭐ 关键修复 3：手写 STORE-only ZIP writer
+//
+// 原因：`zip` crate 的 start_file + finish 会写 data descriptor
+//      （GP flag bit 3 set，Local Header 的 size 字段为 0），
+//      Android bootanimation 逐帧解码时从 Local Header 读 size，
+//      得到 0 → 长度 0 → 显示损坏 → fallback 到 AOSP 动画。
+//
+//      系统 `zip` 命令先 stat 文件拿到长度，Local Header 写真实 size，
+//      所以 unzip + zip 一遍就能恢复。
+//
+// 这里手写 STORE-only writer，Local Header 写真实 crc/size，
+// GP flag = 0，完全对齐 `zip -0` 的输出格式。
+// ============================================================
+fn write_android_zip(
+    out: &Path,
+    entries: &[(String, Vec<u8>, bool)],
+) -> Result<(), String> {
+    struct Cd {
+        name: Vec<u8>,
+        crc: u32,
+        size: u32,
+        offset: u32,
+        is_dir: bool,
     }
-    d.push('\n');
-    d
+
+    let mut f = fs::File::create(out)
+        .map_err(|e| format!("创建 {} 失败: {}", out.display(), e))?;
+    let mut central: Vec<Cd> = Vec::with_capacity(entries.len());
+
+    for (name, data, is_dir) in entries {
+        if data.len() > u32::MAX as usize {
+            return Err(format!("ZIP entry {} 过大 (>4GB 不支持)", name));
+        }
+        let offset = f.stream_position().map_err(|e| e.to_string())?;
+        if offset > u32::MAX as u64 {
+            return Err("ZIP 总大小超过 4GB 未支持".into());
+        }
+        let offset = offset as u32;
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(format!("ZIP entry 名过长: {}", name));
+        }
+        let crc = crc32fast::hash(data);
+        let size = data.len() as u32;
+
+        // -------- Local File Header (30 + name len bytes) --------
+        f.write_all(&0x04034b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&20u16.to_le_bytes()).map_err(|e| e.to_string())?; // version needed = 2.0
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;  // ⭐ GP flag = 0
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;  // method = STORE
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;  // mod time
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;  // mod date
+        f.write_all(&crc.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&size.to_le_bytes()).map_err(|e| e.to_string())?;  // ⭐ compressed
+        f.write_all(&size.to_le_bytes()).map_err(|e| e.to_string())?;  // ⭐ uncompressed
+        f.write_all(&(name_bytes.len() as u16).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;  // extra len
+        f.write_all(name_bytes).map_err(|e| e.to_string())?;
+        f.write_all(data).map_err(|e| e.to_string())?;
+
+        central.push(Cd {
+            name: name_bytes.to_vec(),
+            crc,
+            size,
+            offset,
+            is_dir: *is_dir,
+        });
+    }
+
+    let cd_start = f.stream_position().map_err(|e| e.to_string())?;
+    if cd_start > u32::MAX as u64 {
+        return Err("ZIP 总大小超过 4GB 未支持".into());
+    }
+    let cd_start_u32 = cd_start as u32;
+
+    // -------- Central Directory Header --------
+    for r in &central {
+        f.write_all(&0x02014b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&0x0314u16.to_le_bytes()).map_err(|e| e.to_string())?; // made by: unix, ver 2.0
+        f.write_all(&20u16.to_le_bytes()).map_err(|e| e.to_string())?;     // needed
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // flag
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // method
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // time
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // date
+        f.write_all(&r.crc.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&r.size.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&r.size.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&(r.name.len() as u16).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // extra
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // comment
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // disk start
+        f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;      // internal attrs
+        let ext: u32 = if r.is_dir {
+            (0o040755u32 << 16) | 0x10  // unix dir + MS-DOS dir
+        } else {
+            0o100644u32 << 16           // unix regular file
+        };
+        f.write_all(&ext.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&r.offset.to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&r.name).map_err(|e| e.to_string())?;
+    }
+
+    let cd_end = f.stream_position().map_err(|e| e.to_string())?;
+    let cd_size = (cd_end - cd_start) as u32;
+    let n = central.len() as u16;
+
+    // -------- End of Central Directory --------
+    f.write_all(&0x06054b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&n.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&n.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&cd_size.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&cd_start_u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
+
+    f.flush().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn is_image_file(path: &Path) -> bool {
@@ -1681,30 +1680,106 @@ fn is_image_file(path: &Path) -> bool {
     }
 }
 
-/// 显式写入目录条目，匹配 `zip -rq -0` 的行为，
-/// 避免 Android / ColorOS bootanimation 解析器因缺少目录条目而异常。
-fn add_dir_to_zip(
-    zip: &mut zip_crate::ZipWriter<fs::File>,
+fn collect_parts_dirs(parts: &Path) -> Result<Vec<String>, String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for e in fs::read_dir(parts).map_err(|e| format!("读取 parts 失败: {}", e))? {
+        let p = e.map_err(|e| e.to_string())?.path();
+        if p.is_dir() {
+            dirs.push(p.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+// ============================================================
+// ⭐ 关键修复 4：desc.txt 里的 part 目录名用 parts/ 下的真实目录名，
+// 并对 config.json 引用不存在目录的情况报错（而非静默错误）。
+// ============================================================
+fn generate_desc(
+    config: &Config,
+    w: u32,
+    h: u32,
+    coloros: bool,
+    actual_dirs: &[String],
+) -> Result<String, String> {
+    let fps = config.fps.unwrap_or(60);
+    let mut d = if coloros {
+        let ox = config.offset_x.unwrap_or(0);
+        let oy = config.offset_y.unwrap_or(0);
+        format!("g {} {} {} {} {}\n", w, h, ox, oy, fps)
+    } else {
+        format!("{} {} {}\n", w, h, fps)
+    };
+
+    // 用 basename 匹配（config.json 可能写 "part0" / "parts/part0" / "./part0"）
+    let base_of = |p: &str| -> String {
+        Path::new(p)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string())
+    };
+
+    let mut used: Vec<(String, String, u32, u32)> = Vec::new(); // (real_dir, type, loop, pause)
+    for p in &config.part {
+        let base = base_of(&p.path);
+        if !actual_dirs.iter().any(|d| d == &base) {
+            return Err(format!(
+                "{} '{}' {} {:?}",
+                match detect_lang() {
+                    Lang::Zh => "config.json 引用的目录不存在:",
+                    Lang::En => "config.json references non-existent dir:",
+                },
+                p.path,
+                match detect_lang() {
+                    Lang::Zh => "可用目录:",
+                    Lang::En => "available:",
+                },
+                actual_dirs
+            ));
+        }
+        used.push((
+            base,
+            p.part_type.clone().unwrap_or_else(|| "p".into()),
+            p.loop_count.unwrap_or(0),
+            p.pause.unwrap_or(0),
+        ));
+    }
+
+    // config.part 为空时，全部 parts 目录按默认 p 0 0 处理
+    if used.is_empty() {
+        for d in actual_dirs {
+            used.push((d.clone(), "p".into(), 0, 0));
+        }
+    }
+
+    for (name, ptype, ploop, ppause) in &used {
+        d.push_str(&format!("{} {} {} {}\n", ptype, ploop, ppause, name));
+    }
+    d.push('\n');
+    Ok(d)
+}
+
+fn collect_files_recursive(
     dir: &Path,
     prefix: &str,
-    opts: zip_crate::write::FileOptions,
+    out: &mut Vec<(String, Vec<u8>, bool)>,
 ) -> Result<(), String> {
-    for e in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let e = e.map_err(|e| e.to_string())?;
-        let p = e.path();
+    let mut items: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .collect();
+    items.sort();
+    for p in items {
         let name = p.file_name().unwrap().to_string_lossy();
         let zp = format!("{}{}", prefix, name);
         if p.is_dir() {
-            zip.add_directory(format!("{}/", zp), opts)
-                .map_err(|e| e.to_string())?;
-            add_dir_to_zip(zip, &p, &format!("{}/", zp), opts)?;
-        } else {
-            if !is_image_file(&p) {
-                continue;
-            }
-            zip.start_file(&zp, opts).map_err(|e| e.to_string())?;
-            let data = fs::read(&p).map_err(|e| e.to_string())?;
-            zip.write_all(&data).map_err(|e| e.to_string())?;
+            out.push((format!("{}/", zp), Vec::new(), true));
+            collect_files_recursive(&p, &format!("{}/", zp), out)?;
+        } else if is_image_file(&p) {
+            let data = fs::read(&p)
+                .map_err(|e| format!("读取 {} 失败: {}", p.display(), e))?;
+            out.push((zp, data, false));
         }
     }
     Ok(())
@@ -1722,34 +1797,34 @@ fn make_zip(
         detect_resolution()
     };
 
-    let desc = generate_desc(config, w, h, coloros);
-    let file = fs::File::create(out).map_err(|e| e.to_string())?;
-    let mut zip = zip_crate::ZipWriter::new(file);
-    let opts = zip_crate::write::FileOptions::default()
-        .compression_method(zip_crate::CompressionMethod::Stored);
-
-    zip.start_file("desc.txt", opts).map_err(|e| e.to_string())?;
-    zip.write_all(desc.as_bytes()).map_err(|e| e.to_string())?;
-
-    let parts = src.join("parts");
-    if !parts.exists() {
+    let parts_root = src.join("parts");
+    if !parts_root.is_dir() {
         return Err(match detect_lang() {
             Lang::Zh => "parts 目录不存在".into(),
             Lang::En => "parts directory not found".into(),
         });
     }
-    for e in fs::read_dir(&parts).map_err(|e| e.to_string())? {
-        let e = e.map_err(|e| e.to_string())?;
-        let p = e.path();
-        if p.is_dir() {
-            let n = p.file_name().unwrap().to_string_lossy();
-            zip.add_directory(format!("{}/", n), opts)
-                .map_err(|e| e.to_string())?;
-            add_dir_to_zip(&mut zip, &p, &format!("{}/", n), opts)?;
-        }
+
+    let dirs = collect_parts_dirs(&parts_root)?;
+    if dirs.is_empty() {
+        return Err(match detect_lang() {
+            Lang::Zh => "parts 目录为空".into(),
+            Lang::En => "parts directory is empty".into(),
+        });
     }
-    zip.finish().map_err(|e| e.to_string())?;
-    Ok(())
+
+    let desc = generate_desc(config, w, h, coloros, &dirs)?;
+
+    let mut entries: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    entries.push(("desc.txt".into(), desc.into_bytes(), false));
+
+    for d in &dirs {
+        let p = parts_root.join(d);
+        entries.push((format!("{}/", d), Vec::new(), true));
+        collect_files_recursive(&p, &format!("{}/", d), &mut entries)?;
+    }
+
+    write_android_zip(out, &entries)
 }
 
 fn extract_zip(src: &str, dest: &Path) -> Result<(), String> {
@@ -1802,17 +1877,15 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
     let system_format = if coloros { "coloros" } else { "aosp" };
 
     if coloros {
-        let m = match detect_lang() {
+        log_info(flags, match detect_lang() {
             Lang::Zh => "检测到 ColorOS 路径，desc.txt 将使用 g 格式",
             Lang::En => "ColorOS path detected, desc.txt will use g format",
-        };
-        log_info(flags, m);
+        });
     } else {
-        let m = match detect_lang() {
+        log_info(flags, match detect_lang() {
             Lang::Zh => "检测到 AOSP 路径，desc.txt 将使用标准格式",
             Lang::En => "AOSP path detected, desc.txt will use standard format",
-        };
-        log_info(flags, m);
+        });
     }
 
     let current_now_id = read_now_id(&moddir).unwrap_or(None);
@@ -1950,7 +2023,23 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
             info.id
         );
         log_info(flags, &proc_msg);
-        make_zip(&path, &config, &out_zip, coloros)?;
+
+        // ⭐ 关键：make_zip 用的是手写 STORE writer，Local Header 带真实 size
+        if let Err(e) = make_zip(&path, &config, &out_zip, coloros) {
+            let w = format!(
+                "{} {}: {}",
+                match detect_lang() {
+                    Lang::Zh => "打包失败",
+                    Lang::En => "zip failed",
+                },
+                info.id,
+                e
+            );
+            log_error(flags, &w);
+            let _ = fs::remove_dir_all(&target);
+            skipped.push(info.id.clone());
+            continue;
+        }
 
         fs::copy(&info_path, target.join("info.json")).map_err(|e| e.to_string())?;
 
@@ -2005,7 +2094,6 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&tmp);
 
-    // 首次安装且 settings.bootanimation 为空 → 设置为第一个安装的动画
     if !installed.is_empty() && updated.is_empty() {
         let mut settings = read_settings(&moddir).unwrap_or_default();
         let empty = settings
@@ -2070,18 +2158,9 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
 // help
 // ============================================================
 fn print_help(prog: &str) {
-    let h = match detect_lang() {
-        Lang::Zh => "用法",
-        Lang::En => "Usage",
-    };
-    let c = match detect_lang() {
-        Lang::Zh => "命令",
-        Lang::En => "Commands",
-    };
-    let o = match detect_lang() {
-        Lang::Zh => "全局选项",
-        Lang::En => "Global Options",
-    };
+    let h = match detect_lang() { Lang::Zh => "用法", Lang::En => "Usage" };
+    let c = match detect_lang() { Lang::Zh => "命令", Lang::En => "Commands" };
+    let o = match detect_lang() { Lang::Zh => "全局选项", Lang::En => "Global Options" };
     let j = match detect_lang() {
         Lang::Zh => "以 JSON 格式输出到 stdout",
         Lang::En => "output JSON to stdout",
@@ -2125,31 +2204,22 @@ settings.json 格式：
     "enable": true,
     "language": "zh_CN"
   }}
-  - enable=false 时：
-      * apply（含 post-fs-data.sh 自动调用）返回 success:false，提示"已禁用"
-      * once_apply / apply --temp 不受影响
-      * once_bootanimation 保留，待 enable=true 后消费
-  - language 为最高优先级的界面语言（zh* → 中文，en* → 英文），
-    不存在时才使用环境变量检测
+  - enable=false 时 apply（含 post-fs-data.sh 自动调用）返回非 0 退出码
+  - once_apply / apply --temp 不受 enable 影响
+  - language 为最高优先级的界面语言（zh* → 中文，en* → 英文）
 
 ID 文件角色：
   once_bootanimation  →  一次性，apply 成功后自动删除
   settings.json       →  持久化配置（bootanimation + enable + language）
   now_bootanimation   →  当前实际生效的（apply / apply_temp 成功后写入）
-
-如何判断当前是 once/temp 挂载：
-  对比 status 输出的 now_animation_id 与 config_animation_id
-    一致       →  持久化模式
-    不一致     →  once_apply 或 apply --temp 挂的
-    now 为空   →  未挂载 / 已 revert
 "#,
         help = h,
         prog = prog,
         cmd = c,
         opt = o,
         apply_zh = match detect_lang() {
-            Lang::Zh => "挂载动画（enable=false 时返回失败；once → settings 优先）",
-            Lang::En => "mount animation (returns failure when enable=false; once → settings priority)",
+            Lang::Zh => "挂载动画（失败返回非 0；once → settings 优先）",
+            Lang::En => "mount animation (non-zero exit on failure; once → settings priority)",
         },
         temp_zh = match detect_lang() {
             Lang::Zh => "临时挂载指定动画（无状态，不受 enable 影响，重启失效）",
