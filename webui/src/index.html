@@ -1,76 +1,11 @@
 <!DOCTYPE html>
 <html lang="zh-CN" class="mdui-theme-auto">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>开机动画管理器</title>
-  <style>
-    .page { display: none; }
-    .page.active { display: block; }
-    .page-wrap { padding: 16px; max-width: 720px; margin: 0 auto; }
-    .page-title { font-size: 1.3rem; font-weight: 600; margin-bottom: 16px; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" ...>
+<title>开机动画管理器</title>
 </head>
 <body>
-  <!-- 第一页：状态 -->
-  <div class="page active" id="page-status">
-    <div class="page-wrap">
-      <div class="page-title">状态</div>
-      <mdui-card style="width:100%; margin-bottom:16px;">
-        <div style="padding:16px;" id="status-content">读取中...</div>
-      </mdui-card>
-      <mdui-card style="width:100%;">
-        <div style="padding:16px;">
-          <div style="font-weight:600; font-size:0.95rem; margin-bottom:12px;">操作</div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <mdui-button variant="filled" id="btn-apply">应用当前配置</mdui-button>
-            <mdui-button variant="outlined" id="btn-revert">卸载动画</mdui-button>
-            <mdui-button variant="text" id="btn-check">检查生效状态</mdui-button>
-          </div>
-        </div>
-      </mdui-card>
-    </div>
-  </div>
-
-  <!-- 第二页：动画列表 -->
-  <div class="page" id="page-list">
-    <div class="page-wrap">
-      <div class="page-title">已安装动画</div>
-      <div id="anim-list">加载中...</div>
-    </div>
-  </div>
-
-  <!-- 第三页：安装 -->
-  <div class="page" id="page-install">
-    <div class="page-wrap">
-      <div class="page-title">安装动画包</div>
-      <div id="install-path" style="font-size:0.78rem; font-family:monospace; opacity:0.7; word-break:break-all; margin-bottom:8px;">/sdcard</div>
-      <div style="display:flex; gap:8px; margin-bottom:12px;">
-        <mdui-button variant="outlined" id="btn-up" style="flex:0 0 auto;">上一级</mdui-button>
-        <mdui-button variant="filled" id="btn-confirm" style="flex:1;" disabled>安装选中文件</mdui-button>
-      </div>
-      <div id="install-body">
-        <div style="text-align:center; padding:20px; opacity:0.5;">加载中...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 底栏（mdui v2） -->
-  <mdui-navigation-bar value="status" id="bottom-nav" label-visibility="labeled">
-    <mdui-navigation-bar-item value="status">
-      <mdui-icon-info slot="icon"></mdui-icon-info>
-      状态
-    </mdui-navigation-bar-item>
-    <mdui-navigation-bar-item value="list">
-      <mdui-icon-apps slot="icon"></mdui-icon-apps>
-      动画
-    </mdui-navigation-bar-item>
-    <mdui-navigation-bar-item value="install">
-      <mdui-icon-add slot="icon"></mdui-icon-add>
-      安装
-    </mdui-navigation-bar-item>
-  </mdui-navigation-bar>
-
-  <script type="module" src="./main.js"></script>
+<script type="module" src="./main.js"></script>
 </body>
 </html>

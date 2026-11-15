@@ -3,18 +3,22 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::OnceLock;
 
 use hex::encode as hex_encode;
 use rustix::mount::{mount, unmount, MountFlags, UnmountFlags};
 use sha2::{Digest, Sha256};
 use zip as zip_crate;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ============================================================
 // 常量
 // ============================================================
-const BOOT_TXT: &str = "bootanimation.txt";
+const SETTINGS_JSON: &str = "settings.json";     // 持久化配置
+const ONCE_TXT: &str = "once_bootanimation";     // 一次性：下次 apply 用完即删
+const NOW_TXT: &str = "now_bootanimation";       // 当前实际应用的动画 ID
+
 const ANIM_DIR: &str = "bootanimations";
 
 const SYSTEM_CANDIDATES: &[&str] = &[
@@ -30,15 +34,98 @@ const COLOROS_CANDIDATES: &[&str] = &[
 ];
 
 // ============================================================
-// 语言检测
+// settings.json
 // ============================================================
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Clone)]
+struct Settings {
+    /// 默认动画 ID；None 表示未设置
+    #[serde(default)]
+    bootanimation: Option<String>,
+    /// false 时 apply（开机自动挂载）直接失败；once_apply / apply --temp 不受影响
+    #[serde(default = "default_enable")]
+    enable: bool,
+    /// 界面语言，最高优先级；"zh_CN" / "en_US" 等
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
+
+fn default_enable() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            bootanimation: None,
+            enable: true,
+            language: None,
+        }
+    }
+}
+
+fn read_settings(moddir: &Path) -> Result<Settings, String> {
+    let path = moddir.join(SETTINGS_JSON);
+    if !path.exists() {
+        return Ok(Settings::default());
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("读取 {} 失败: {}", path.display(), e))?;
+    if content.trim().is_empty() {
+        return Ok(Settings::default());
+    }
+    serde_json::from_str(&content)
+        .map_err(|e| format!("解析 {} 失败: {}", path.display(), e))
+}
+
+fn write_settings(moddir: &Path, settings: &Settings) -> Result<(), String> {
+    let path = moddir.join(SETTINGS_JSON);
+    let content = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("序列化 settings 失败: {}", e))?;
+    fs::write(&path, content)
+        .map_err(|e| format!("写入 {} 失败: {}", path.display(), e))
+}
+
+// ============================================================
+// 语言检测
+//
+// 优先级：
+//   1. settings.json 的 language 字段（zh* → Zh，en* → En）
+//   2. INFO_ENG / INFO_EN 环境变量
+//   3. LANG / LC_ALL / LC_MESSAGES / LANGUAGE
+//   4. 默认 En
+//
+// 用 OnceLock 缓存，避免每次 log 都读文件；
+// 直接读文件而不经过 read_settings，避免解析失败时 log 递归。
+// ============================================================
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang {
     Zh,
     En,
 }
 
-fn detect_lang() -> Lang {
+fn detect_lang_from_settings() -> Option<Lang> {
+    let moddir = mod_dir();
+    let path = moddir.join(SETTINGS_JSON);
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let lang = v.get("language")?.as_str()?.trim();
+    if lang.is_empty() {
+        return None;
+    }
+    let l = lang.to_lowercase();
+    if l.starts_with("zh") {
+        Some(Lang::Zh)
+    } else if l.starts_with("en") {
+        Some(Lang::En)
+    } else {
+        None
+    }
+}
+
+fn detect_lang_from_env() -> Lang {
     for var in &["INFO_ENG", "INFO_EN"] {
         if let Ok(val) = env::var(var) {
             let v = val.to_lowercase();
@@ -67,6 +154,13 @@ fn detect_lang() -> Lang {
         .or_else(|| check_var("LC_MESSAGES"))
         .or_else(|| check_var("LANGUAGE"))
         .unwrap_or(Lang::En)
+}
+
+fn detect_lang() -> Lang {
+    static CACHE: OnceLock<Lang> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        detect_lang_from_settings().unwrap_or_else(detect_lang_from_env)
+    })
 }
 
 // ============================================================
@@ -172,7 +266,7 @@ fn json_output<T: Serialize>(value: &T) -> Result<(), String> {
 }
 
 // ============================================================
-// 路径工具
+// 路径 / ID 读取工具
 // ============================================================
 fn mod_dir() -> PathBuf {
     if let Ok(dir) = env::var("MODDIR") {
@@ -183,9 +277,9 @@ fn mod_dir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn read_boot_id(moddir: &Path) -> Result<Option<String>, String> {
-    let path = moddir.join(BOOT_TXT);
-    let file = match File::open(&path) {
+/// 从任意 ID 文件中读第一个有效行（跳过空行和 # 注释）
+fn read_id_file(path: &Path) -> Result<Option<String>, String> {
+    let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
@@ -198,12 +292,21 @@ fn read_boot_id(moddir: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// 一次性动画（下次 apply 用完即删）
+fn read_once_id(moddir: &Path) -> Result<Option<String>, String> {
+    read_id_file(&moddir.join(ONCE_TXT))
+}
+
+/// 当前实际应用的动画
+fn read_now_id(moddir: &Path) -> Result<Option<String>, String> {
+    read_id_file(&moddir.join(NOW_TXT))
+}
+
 fn animation_zip(moddir: &Path, id: &str) -> PathBuf {
     moddir.join(ANIM_DIR).join(id).join("bootanimation.zip")
 }
 
 /// 返回 (系统动画路径, 是否为 ColorOS 路径)
-/// 探测顺序与挂载时完全一致：先找 AOSP 路径，再找 ColorOS 路径
 fn detect_system_animation_ex() -> Option<(String, bool)> {
     for p in SYSTEM_CANDIDATES {
         if Path::new(p).exists() {
@@ -218,7 +321,6 @@ fn detect_system_animation_ex() -> Option<(String, bool)> {
     None
 }
 
-/// 保留原接口，内部转调
 fn detect_system_animation() -> Option<String> {
     detect_system_animation_ex().map(|(p, _)| p)
 }
@@ -241,9 +343,7 @@ fn bind_unmount(dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("unmount 失败 {}: {:?}", dst.display(), e))
 }
 
-/// 强制卸载目标路径上的所有挂载层（不论是谁挂的）。
-/// 循环最多 8 次，每次先普通 unmount，失败再 MNT_DETACH。
-/// 每次都重新检测 is_mounted，确保多层叠加也能清空。
+/// 强制卸载目标路径上的所有挂载层
 fn force_unmount_all(target: &str) {
     let p = Path::new(target);
     for _ in 0..8 {
@@ -251,9 +351,7 @@ fn force_unmount_all(target: &str) {
             return;
         }
         if unmount(p, UnmountFlags::empty()).is_err() {
-            // 兜底：lazy detach，对 busy 的挂载也有效
             if unmount(p, UnmountFlags::MNT_DETACH).is_err() {
-                // 连 detach 都失败，退出避免死循环
                 return;
             }
         }
@@ -386,8 +484,12 @@ struct RevertData {
 #[derive(Serialize)]
 struct StatusData {
     system_path: Option<String>,
-    system_format: Option<String>, // "aosp" / "coloros"
+    system_format: Option<String>,
+    enabled: bool,
+    language: Option<String>,
     animation_id: Option<String>,
+    now_animation_id: Option<String>,
+    config_animation_id: Option<String>,
     module_file_exists: bool,
     main_mounted: bool,
     dark_mounted: bool,
@@ -397,6 +499,9 @@ struct StatusData {
 #[derive(Serialize)]
 struct CheckData {
     animation_id: Option<String>,
+    now_animation_id: Option<String>,
+    config_animation_id: Option<String>,
+    enabled: bool,
     module_hash: Option<String>,
     system_hash: Option<String>,
     module_exists: bool,
@@ -413,6 +518,12 @@ struct UseData {
 }
 
 #[derive(Serialize)]
+struct ToggleData {
+    enabled: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
 struct ApplyTempData {
     animation_id: String,
     message: String,
@@ -422,7 +533,7 @@ struct ApplyTempData {
 
 #[derive(Serialize)]
 struct InstallData {
-    system_format: String, // "aosp" / "coloros"
+    system_format: String,
     installed: Vec<String>,
     updated: Vec<String>,
     skipped: Vec<String>,
@@ -543,51 +654,99 @@ fn info_cmd(flags: &GlobalFlags, ids: &[String]) -> Result<(), String> {
 
 // ============================================================
 // apply
+//
+// enable=false → 返回 success:false，明确告知原因，不消费 once
 // ============================================================
 fn apply(flags: &GlobalFlags) -> Result<(), String> {
     let moddir = mod_dir();
+    let settings = read_settings(&moddir)?;
 
-    let id = match read_boot_id(&moddir)? {
-        Some(id) => id,
-        None => {
-            let msg = match detect_lang() {
-                Lang::Zh => "bootanimation.txt 为空，跳过".to_string(),
-                Lang::En => "bootanimation.txt is empty, skipping".to_string(),
-            };
-            log_warn(flags, &msg);
-            if flags.json {
-                json_output(&CmdResult::<ApplyData> {
-                    success: false,
-                    data: None,
-                    error: Some(msg),
-                })?;
+    // 禁用状态下直接返回失败，不消费 once
+    if !settings.enable {
+        let msg = match detect_lang() {
+            Lang::Zh => {
+                "开机自动生效已被关闭（settings.json: enable=false），跳过挂载".to_string()
             }
-            return Ok(());
-        }
-    };
-
-    if !is_valid_animation(&moddir, &id) {
-        let msg = format!(
-            "{}: {}",
-            match detect_lang() {
-                Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
-                Lang::En => "invalid animation (missing info.json or incomplete)",
-            },
-            id
-        );
-        log_error(flags, &msg);
+            Lang::En => {
+                "auto-mount is disabled (settings.json: enable=false), skipping mount".to_string()
+            }
+        };
+        log_warn(flags, &msg);
         if flags.json {
-            json_output(&CmdResult {
+            json_output(&CmdResult::<ApplyData> {
                 success: false,
-                data: Some(ApplyData {
-                    animation_id: Some(id),
-                    message: msg.clone(),
-                }),
+                data: None,
                 error: Some(msg),
             })?;
         }
         return Ok(());
     }
+
+    let once_path = moddir.join(ONCE_TXT);
+    let once_id = read_once_id(&moddir)?;
+    let boot_id = settings
+        .bootanimation
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+
+    let once_valid = once_id
+        .as_ref()
+        .filter(|i| is_valid_animation(&moddir, i))
+        .cloned();
+    let boot_valid = boot_id
+        .as_ref()
+        .filter(|i| is_valid_animation(&moddir, i))
+        .cloned();
+
+    let (id, is_once): (String, bool) = if let Some(id) = once_valid {
+        (id, true)
+    } else {
+        if let Some(ref bad) = once_id {
+            let _ = fs::remove_file(&once_path);
+            let w = format!(
+                "{}: {}",
+                match detect_lang() {
+                    Lang::Zh => "once_bootanimation 指向的动画无效，已删除并 fallback",
+                    Lang::En => "once_bootanimation points to invalid animation, removed & fallback",
+                },
+                bad
+            );
+            log_warn(flags, &w);
+        }
+        match boot_valid {
+            Some(id) => (id, false),
+            None => {
+                let msg = if let Some(ref bad) = boot_id {
+                    format!(
+                        "{}: {}",
+                        match detect_lang() {
+                            Lang::Zh => "settings.bootanimation 指向的动画无效",
+                            Lang::En => "settings.bootanimation points to invalid animation",
+                        },
+                        bad
+                    )
+                } else {
+                    match detect_lang() {
+                        Lang::Zh => "settings.bootanimation 为空，跳过".to_string(),
+                        Lang::En => "settings.bootanimation is empty, skipping".to_string(),
+                    }
+                };
+                if boot_id.is_some() {
+                    log_error(flags, &msg);
+                } else {
+                    log_warn(flags, &msg);
+                }
+                if flags.json {
+                    json_output(&CmdResult::<ApplyData> {
+                        success: false,
+                        data: None,
+                        error: Some(msg),
+                    })?;
+                }
+                return Ok(());
+            }
+        }
+    };
 
     let zip_path = animation_zip(&moddir, &id);
 
@@ -610,8 +769,6 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         }
     };
 
-    // 无论当前是否被挂载（包括用户手动挂的测试挂载），先清空所有层，
-    // 避免"已挂载"导致跳过或叠加挂载失败。
     if is_mounted(&sys).unwrap_or(false) {
         force_unmount_all(&sys);
         let msg = format!(
@@ -648,8 +805,25 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         }
     }
 
+    let now_path = moddir.join(NOW_TXT);
+    if let Err(e) = fs::write(&now_path, &id) {
+        let w = format!(
+            "{}: {}",
+            match detect_lang() {
+                Lang::Zh => format!("写入 {} 失败", now_path.display()),
+                Lang::En => format!("failed to write {}", now_path.display()),
+            },
+            e
+        );
+        log_warn(flags, &w);
+    }
+
+    if is_once {
+        let _ = fs::remove_file(&once_path);
+    }
+
     let msg = format!(
-        "{}: {}{}",
+        "{}: {}{}{}",
         match detect_lang() {
             Lang::Zh => "成功挂载动画",
             Lang::En => "successfully mounted animation",
@@ -659,6 +833,14 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
             match detect_lang() {
                 Lang::Zh => " (含 dark)",
                 Lang::En => " (with dark)",
+            }
+        } else {
+            ""
+        },
+        if is_once {
+            match detect_lang() {
+                Lang::Zh => " (一次性)",
+                Lang::En => " (once)",
             }
         } else {
             ""
@@ -680,7 +862,7 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
 }
 
 // ============================================================
-// apply_temp
+// apply_temp（无状态，不受 enable 影响）
 // ============================================================
 fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
@@ -726,7 +908,6 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
         }
     };
 
-    // 无论是否已被挂载，先清空所有层再挂，避免叠加/占用导致失败。
     if is_mounted(&sys).unwrap_or(false) {
         force_unmount_all(&sys);
         let msg = format!(
@@ -761,6 +942,19 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
             log_ok(flags, &ok_dark);
             dark_mounted = true;
         }
+    }
+
+    let now_path = moddir.join(NOW_TXT);
+    if let Err(e) = fs::write(&now_path, id) {
+        let w = format!(
+            "{}: {}",
+            match detect_lang() {
+                Lang::Zh => format!("写入 {} 失败", now_path.display()),
+                Lang::En => format!("failed to write {}", now_path.display()),
+            },
+            e
+        );
+        log_warn(flags, &w);
     }
 
     let msg = format!(
@@ -804,6 +998,8 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
 // revert
 // ============================================================
 fn revert(flags: &GlobalFlags) -> Result<(), String> {
+    let moddir = mod_dir();
+
     let sys = match detect_system_animation() {
         Some(s) => s,
         None => {
@@ -826,7 +1022,6 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
     let mut unmounted = Vec::new();
 
     if is_mounted(&sys)? {
-        // revert 也改用 force_unmount_all，确保多层叠加全部清空
         force_unmount_all(&sys);
         let ok_msg = match detect_lang() {
             Lang::Zh => format!("已卸载: {}", sys),
@@ -846,6 +1041,11 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
             log_ok(flags, &ok_msg);
             unmounted.push(dark);
         }
+    }
+
+    let now_path = moddir.join(NOW_TXT);
+    if now_path.exists() {
+        let _ = fs::remove_file(&now_path);
     }
 
     let msg: String = if unmounted.is_empty() {
@@ -889,9 +1089,18 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
     });
 
     let moddir = mod_dir();
-    let id = read_boot_id(&moddir).unwrap_or(None);
+    let settings = read_settings(&moddir).unwrap_or_default();
+    let config_id = settings
+        .bootanimation
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let enabled = settings.enable;
+    let language = settings.language.clone();
+    let now_id = read_now_id(&moddir).unwrap_or(None);
 
-    let module_exists = id
+    let effective_id = now_id.clone().or_else(|| config_id.clone());
+
+    let module_exists = effective_id
         .as_ref()
         .map(|i| animation_zip(&moddir, i).exists())
         .unwrap_or(false);
@@ -915,7 +1124,11 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
     let data = StatusData {
         system_path: sys.clone(),
         system_format: format.clone(),
-        animation_id: id.clone(),
+        enabled,
+        language: language.clone(),
+        animation_id: effective_id.clone(),
+        now_animation_id: now_id.clone(),
+        config_animation_id: config_id.clone(),
         module_file_exists: module_exists,
         main_mounted,
         dark_mounted,
@@ -937,9 +1150,25 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
             Lang::Zh => "系统格式",
             Lang::En => "system_format",
         };
-        let l_id = match detect_lang() {
-            Lang::Zh => "配置动画 ID",
-            Lang::En => "animation_id",
+        let l_en = match detect_lang() {
+            Lang::Zh => "启用状态 (enable)",
+            Lang::En => "enabled",
+        };
+        let l_lang = match detect_lang() {
+            Lang::Zh => "语言 (language)",
+            Lang::En => "language",
+        };
+        let l_eff = match detect_lang() {
+            Lang::Zh => "实际生效 ID",
+            Lang::En => "effective_id",
+        };
+        let l_now = match detect_lang() {
+            Lang::Zh => "当前已挂载 ID (now)",
+            Lang::En => "now_animation_id",
+        };
+        let l_cfg = match detect_lang() {
+            Lang::Zh => "配置 ID (settings.bootanimation)",
+            Lang::En => "config_animation_id",
         };
         let l_mod = match detect_lang() {
             Lang::Zh => "模块文件存在",
@@ -953,15 +1182,22 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
             Lang::Zh => "Dark 动画",
             Lang::En => "dark_mounted",
         };
+        let none_str = match detect_lang() {
+            Lang::Zh => "(未设置)",
+            Lang::En => "(not set)",
+        };
         let sys_str = sys.as_deref().unwrap_or(match detect_lang() {
             Lang::Zh => "(未检测到)",
             Lang::En => "(not found)",
         });
         let fmt_str = format.as_deref().unwrap_or("(unknown)");
-        let id_str = id.as_deref().unwrap_or(match detect_lang() {
-            Lang::Zh => "(未设置)",
-            Lang::En => "(not set)",
+        let lang_str = language.as_deref().unwrap_or(match detect_lang() {
+            Lang::Zh => "(自动检测)",
+            Lang::En => "(auto-detect)",
         });
+        let eff_str = effective_id.as_deref().unwrap_or(none_str);
+        let now_str = now_id.as_deref().unwrap_or(none_str);
+        let cfg_str = config_id.as_deref().unwrap_or(none_str);
         let sources_str = if !main_sources.is_empty() {
             format!(" ({})", main_sources.join(", "))
         } else {
@@ -969,7 +1205,11 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
         };
         eprintln!("{}: {}", l_sys, sys_str);
         eprintln!("{}: {}", l_fmt, fmt_str);
-        eprintln!("{}: {}", l_id, id_str);
+        eprintln!("{}: {}", l_en, enabled);
+        eprintln!("{}: {}", l_lang, lang_str);
+        eprintln!("{}: {}", l_eff, eff_str);
+        eprintln!("{}: {}", l_now, now_str);
+        eprintln!("{}: {}", l_cfg, cfg_str);
         eprintln!("{}: {}", l_mod, module_exists);
         eprintln!("{}: {}{}", l_main, main_mounted, sources_str);
         eprintln!("{}: {}", l_dark, dark_mounted);
@@ -984,12 +1224,22 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
 fn check(flags: &GlobalFlags) -> Result<(), String> {
     let moddir = mod_dir();
 
-    let id = match read_boot_id(&moddir)? {
+    let settings = read_settings(&moddir).unwrap_or_default();
+    let config_id = settings
+        .bootanimation
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let enabled = settings.enable;
+    let now_id = read_now_id(&moddir)?;
+
+    let effective_id = now_id.clone().or_else(|| config_id.clone());
+
+    let id = match effective_id {
         Some(id) => id,
         None => {
             let msg = match detect_lang() {
-                Lang::Zh => "bootanimation.txt 为空",
-                Lang::En => "bootanimation.txt is empty",
+                Lang::Zh => "没有可检查的动画（now_bootanimation 和 settings.bootanimation 都为空）",
+                Lang::En => "no animation to check (both now_bootanimation and settings.bootanimation are empty)",
             };
             log_warn(flags, msg);
             if flags.json {
@@ -1056,14 +1306,27 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
             Lang::En => "not mounted".into(),
         }
     } else {
-        match detect_lang() {
-            Lang::Zh => "哈希不一致（可能被覆盖）".into(),
-            Lang::En => "hash mismatch (may be overridden)".into(),
+        match (now_id.as_ref(), config_id.as_ref()) {
+            (Some(_), _) => match detect_lang() {
+                Lang::Zh => "系统实际挂载的动画与 now_bootanimation 不一致".into(),
+                Lang::En => "actual mounted animation differs from now_bootanimation".into(),
+            },
+            (None, Some(_)) => match detect_lang() {
+                Lang::Zh => "系统实际挂载的动画与 settings.bootanimation 不一致".into(),
+                Lang::En => "actual mounted animation differs from settings.bootanimation".into(),
+            },
+            _ => match detect_lang() {
+                Lang::Zh => "哈希不一致（可能被覆盖）".into(),
+                Lang::En => "hash mismatch (may be overridden)".into(),
+            },
         }
     };
 
     let data = CheckData {
         animation_id: Some(id.clone()),
+        now_animation_id: now_id.clone(),
+        config_animation_id: config_id.clone(),
+        enabled,
         module_hash: module_hash.clone(),
         system_hash: system_hash.clone(),
         module_exists,
@@ -1081,8 +1344,20 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
         })?;
     } else {
         let l_id = match detect_lang() {
-            Lang::Zh => "配置动画 ID",
-            Lang::En => "animation_id",
+            Lang::Zh => "比对 ID",
+            Lang::En => "checking_id",
+        };
+        let l_now = match detect_lang() {
+            Lang::Zh => "now_bootanimation",
+            Lang::En => "now_animation_id",
+        };
+        let l_cfg = match detect_lang() {
+            Lang::Zh => "settings.bootanimation",
+            Lang::En => "config_animation_id",
+        };
+        let l_en = match detect_lang() {
+            Lang::Zh => "enable",
+            Lang::En => "enabled",
         };
         let l_modh = match detect_lang() {
             Lang::Zh => "模块动画哈希",
@@ -1104,21 +1379,26 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
             Lang::Zh => "原因",
             Lang::En => "reason",
         };
+        let none_str = match detect_lang() {
+            Lang::Zh => "(未设置)",
+            Lang::En => "(not set)",
+        };
+        let notfound_str = match detect_lang() {
+            Lang::Zh => "(不存在)",
+            Lang::En => "(not found)",
+        };
         let mod_h = module_hash
             .as_ref()
             .map(|h| h[..16].to_string())
-            .unwrap_or_else(|| match detect_lang() {
-                Lang::Zh => "(不存在)".into(),
-                Lang::En => "(not found)".into(),
-            });
+            .unwrap_or_else(|| notfound_str.into());
         let sys_h = system_hash
             .as_ref()
             .map(|h| h[..16].to_string())
-            .unwrap_or_else(|| match detect_lang() {
-                Lang::Zh => "(不存在)".into(),
-                Lang::En => "(not found)".into(),
-            });
+            .unwrap_or_else(|| notfound_str.into());
         eprintln!("{}: {}", l_id, id);
+        eprintln!("{}: {}", l_now, now_id.as_deref().unwrap_or(none_str));
+        eprintln!("{}: {}", l_cfg, config_id.as_deref().unwrap_or(none_str));
+        eprintln!("{}: {}", l_en, enabled);
         eprintln!("{}: {}", l_modh, mod_h);
         eprintln!("{}: {}", l_sysh, sys_h);
         eprintln!("{}: {}", l_mnt, mounted);
@@ -1141,7 +1421,7 @@ fn check(flags: &GlobalFlags) -> Result<(), String> {
 }
 
 // ============================================================
-// use
+// use（持久化配置）
 // ============================================================
 fn use_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
     let moddir = mod_dir();
@@ -1166,9 +1446,9 @@ fn use_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let txt_path = moddir.join(BOOT_TXT);
-    fs::write(&txt_path, id)
-        .map_err(|e| format!("写入 {} 失败: {}", txt_path.display(), e))?;
+    let mut settings = read_settings(&moddir)?;
+    settings.bootanimation = Some(id.to_string());
+    write_settings(&moddir, &settings)?;
 
     let msg = format!(
         "{}: {}",
@@ -1195,6 +1475,103 @@ fn use_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
 }
 
 // ============================================================
+// once_apply（一次性动画）
+// ============================================================
+fn once_apply_cmd(flags: &GlobalFlags, id: &str) -> Result<(), String> {
+    let moddir = mod_dir();
+
+    if !is_valid_animation(&moddir, id) {
+        let msg = format!(
+            "{}: {}",
+            match detect_lang() {
+                Lang::Zh => "动画无效（缺少 info.json 或文件不完整）",
+                Lang::En => "invalid animation (missing info.json or incomplete)",
+            },
+            id
+        );
+        log_error(flags, &msg);
+        if flags.json {
+            json_output(&CmdResult::<UseData> {
+                success: false,
+                data: None,
+                error: Some(msg),
+            })?;
+        }
+        return Ok(());
+    }
+
+    let path = moddir.join(ONCE_TXT);
+    fs::write(&path, id)
+        .map_err(|e| format!("写入 {} 失败: {}", path.display(), e))?;
+
+    let msg = format!(
+        "{}: {}",
+        match detect_lang() {
+            Lang::Zh => "已设置一次性动画（下次 apply 时使用一次，用后删除）",
+            Lang::En => "once animation set (used once on next apply, then removed)",
+        },
+        id
+    );
+    log_ok(flags, &msg);
+
+    if flags.json {
+        json_output(&CmdResult {
+            success: true,
+            data: Some(UseData {
+                animation_id: id.to_string(),
+                message: msg,
+            }),
+            error: None,
+        })?;
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// enable / disable
+// ============================================================
+fn set_enable(flags: &GlobalFlags, value: bool) -> Result<(), String> {
+    let moddir = mod_dir();
+    let mut settings = read_settings(&moddir)?;
+    settings.enable = value;
+    write_settings(&moddir, &settings)?;
+
+    let msg = if value {
+        match detect_lang() {
+            Lang::Zh => "已启用开机自动挂载（enable=true）".to_string(),
+            Lang::En => "auto-mount enabled (enable=true)".to_string(),
+        }
+    } else {
+        match detect_lang() {
+            Lang::Zh => "已禁用开机自动挂载（enable=false）".to_string(),
+            Lang::En => "auto-mount disabled (enable=false)".to_string(),
+        }
+    };
+    log_ok(flags, &msg);
+
+    if flags.json {
+        json_output(&CmdResult {
+            success: true,
+            data: Some(ToggleData {
+                enabled: value,
+                message: msg,
+            }),
+            error: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn enable_cmd(flags: &GlobalFlags) -> Result<(), String> {
+    set_enable(flags, true)
+}
+
+fn disable_cmd(flags: &GlobalFlags) -> Result<(), String> {
+    set_enable(flags, false)
+}
+
+// ============================================================
 // install 相关
 // ============================================================
 #[derive(serde::Deserialize)]
@@ -1212,9 +1589,7 @@ struct Config {
     fps: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
-    /// ColorOS 专用：水平偏移，缺省为 0
     offset_x: Option<i32>,
-    /// ColorOS 专用：垂直偏移，缺省为 0
     offset_y: Option<i32>,
     part: Vec<ConfigPart>,
 }
@@ -1276,11 +1651,6 @@ fn detect_resolution() -> (u32, u32) {
     (1080, 2400)
 }
 
-/// 生成 desc.txt
-/// - coloros = false：AOSP 格式  `W H FPS`
-/// - coloros = true ：ColorOS 格式 `g W H OFFX OFFY FPS`
-/// offset_x / offset_y 缺省填 0
-/// 末尾强制两个换行，模拟脚本里 echo 的隐式空行
 fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
     let fps = config.fps.unwrap_or(60);
     let mut d = if coloros {
@@ -1299,13 +1669,10 @@ fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
             p.path
         ));
     }
-    // 关键：末尾再补一个 \n 形成真正的空行
     d.push('\n');
     d
 }
 
-/// 只允许 jpg / jpeg / png（大小写不敏感）
-/// 与脚本的 `find ... ! -iname "*.jpg" ! -iname "*.png" -delete` 等价
 fn is_image_file(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => {
@@ -1316,14 +1683,8 @@ fn is_image_file(path: &Path) -> bool {
     }
 }
 
-// ============================================================
-// 关键修复：显式写入目录条目
-//
-// Android（尤其 ColorOS）的 bootanimation 解析器在解析 desc.txt
-// 的 part 路径时会依赖显式目录条目，缺失时行为异常。
-// 这里进入每个子目录前先 `add_directory("<name>/")`，
-// 使生成的 ZIP 结构和 `zip -rq -0 out.zip *` 完全一致。
-// ============================================================
+/// 显式写入目录条目，匹配 `zip -rq -0` 的行为，
+/// 避免 Android / ColorOS bootanimation 解析器因缺少目录条目而异常。
 fn add_dir_to_zip(
     zip: &mut zip_crate::ZipWriter<fs::File>,
     dir: &Path,
@@ -1336,12 +1697,10 @@ fn add_dir_to_zip(
         let name = p.file_name().unwrap().to_string_lossy();
         let zp = format!("{}{}", prefix, name);
         if p.is_dir() {
-            // 显式写目录条目，以 / 结尾
             zip.add_directory(format!("{}/", zp), opts)
                 .map_err(|e| e.to_string())?;
             add_dir_to_zip(zip, &p, &format!("{}/", zp), opts)?;
         } else {
-            // 非图片文件直接跳过，不写进 zip
             if !is_image_file(&p) {
                 continue;
             }
@@ -1386,7 +1745,6 @@ fn make_zip(
         let p = e.path();
         if p.is_dir() {
             let n = p.file_name().unwrap().to_string_lossy();
-            // 关键修复：入口 part 目录本身也要写显式目录条目
             zip.add_directory(format!("{}/", n), opts)
                 .map_err(|e| e.to_string())?;
             add_dir_to_zip(&mut zip, &p, &format!("{}/", n), opts)?;
@@ -1438,7 +1796,6 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
     log_info(flags, &extract_msg);
     extract_zip(zip_path, &tmp)?;
 
-    // 用与挂载完全一致的路径探测判断当前系统格式
     let detected = detect_system_animation_ex();
     let coloros = detected
         .as_ref()
@@ -1460,7 +1817,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
         log_info(flags, m);
     }
 
-    let current_id = read_boot_id(&moddir).unwrap_or(None);
+    let current_now_id = read_now_id(&moddir).unwrap_or(None);
 
     let mut installed = Vec::new();
     let mut updated = Vec::new();
@@ -1547,7 +1904,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
 
         let mut was_active = false;
         if is_update {
-            if let Some(ref cur) = current_id {
+            if let Some(ref cur) = current_now_id {
                 if cur == &info.id {
                     was_active = true;
                     if let Some(sys) = detect_system_animation() {
@@ -1650,13 +2007,17 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&tmp);
 
+    // 首次安装且 settings.bootanimation 为空 → 设置为第一个安装的动画
     if !installed.is_empty() && updated.is_empty() {
-        let txt = moddir.join(BOOT_TXT);
-        let empty = fs::read_to_string(&txt)
+        let mut settings = read_settings(&moddir).unwrap_or_default();
+        let empty = settings
+            .bootanimation
+            .as_ref()
             .map(|s| s.trim().is_empty())
             .unwrap_or(true);
         if empty {
-            fs::write(&txt, &installed[0]).map_err(|e| e.to_string())?;
+            settings.bootanimation = Some(installed[0].clone());
+            let _ = write_settings(&moddir, &settings);
             let info = format!(
                 "{}: {}",
                 match detect_lang() {
@@ -1746,6 +2107,9 @@ fn print_help(prog: &str) {
   status                     {status_zh}
   check                      {check_zh}
   use <id>                   {use_zh}
+  once_apply <id>            {once_zh}
+  enable                     {enable_zh}
+  disable                    {disable_zh}
   install <zip>              {install_zh}
   list                       {list_zh}
   info [id...]               {info_zh}
@@ -1756,34 +2120,70 @@ fn print_help(prog: &str) {
   --logs                     {logs}
 
 {all}
+
+settings.json 格式：
+  {{
+    "bootanimation": "id",
+    "enable": true,
+    "language": "zh_CN"
+  }}
+  - enable=false 时：
+      * apply（含 post-fs-data.sh 自动调用）返回 success:false，提示"已禁用"
+      * once_apply / apply --temp 不受影响
+      * once_bootanimation 保留，待 enable=true 后消费
+  - language 为最高优先级的界面语言（zh* → 中文，en* → 英文），
+    不存在时才使用环境变量检测
+
+ID 文件角色：
+  once_bootanimation  →  一次性，apply 成功后自动删除
+  settings.json       →  持久化配置（bootanimation + enable + language）
+  now_bootanimation   →  当前实际生效的（apply / apply_temp 成功后写入）
+
+如何判断当前是 once/temp 挂载：
+  对比 status 输出的 now_animation_id 与 config_animation_id
+    一致       →  持久化模式
+    不一致     →  once_apply 或 apply --temp 挂的
+    now 为空   →  未挂载 / 已 revert
 "#,
         help = h,
         prog = prog,
         cmd = c,
         opt = o,
         apply_zh = match detect_lang() {
-            Lang::Zh => "挂载 bootanimation.txt 中指定的动画（会先清理旧挂载）",
-            Lang::En => "mount animation specified in bootanimation.txt (clears old mounts first)",
+            Lang::Zh => "挂载动画（enable=false 时返回失败；once → settings 优先）",
+            Lang::En => "mount animation (returns failure when enable=false; once → settings priority)",
         },
         temp_zh = match detect_lang() {
-            Lang::Zh => "临时挂载指定动画（不写文件，重启失效，会先清理旧挂载）",
-            Lang::En => "temporarily mount an animation (no write, lost on reboot, clears old mounts first)",
+            Lang::Zh => "临时挂载指定动画（无状态，不受 enable 影响，重启失效）",
+            Lang::En => "temporarily mount an animation (stateless, ignores enable, lost on reboot)",
         },
         revert_zh = match detect_lang() {
-            Lang::Zh => "卸载开机动画（含多层叠加）",
-            Lang::En => "unmount boot animation (all stacked layers)",
+            Lang::Zh => "卸载所有挂载层并删除 now_bootanimation",
+            Lang::En => "unmount all layers and remove now_bootanimation",
         },
         status_zh = match detect_lang() {
-            Lang::Zh => "查看挂载状态",
-            Lang::En => "show mount status",
+            Lang::Zh => "查看状态（enable / language / now / config）",
+            Lang::En => "show status (enable / language / now / config)",
         },
         check_zh = match detect_lang() {
-            Lang::Zh => "检查动画是否生效",
-            Lang::En => "check if animation is active",
+            Lang::Zh => "检查动画是否生效（比对 now 优先，fallback config）",
+            Lang::En => "check if animation is active (now priority, fallback config)",
         },
         use_zh = match detect_lang() {
-            Lang::Zh => "设置默认动画（写文件，不挂载）",
-            Lang::En => "set default animation (write file, no mount)",
+            Lang::Zh => "设置持久化默认动画（写 settings.bootanimation）",
+            Lang::En => "set persistent default animation (writes settings.bootanimation)",
+        },
+        once_zh = match detect_lang() {
+            Lang::Zh => "设置一次性动画（写 once_bootanimation，下次 apply 用一次后删除）",
+            Lang::En => "set once animation (writes once_bootanimation, used once on next apply)",
+        },
+        enable_zh = match detect_lang() {
+            Lang::Zh => "启用开机自动挂载（settings.enable=true）",
+            Lang::En => "enable auto-mount (settings.enable=true)",
+        },
+        disable_zh = match detect_lang() {
+            Lang::Zh => "禁用开机自动挂载（settings.enable=false，apply 会失败）",
+            Lang::En => "disable auto-mount (settings.enable=false; apply fails)",
         },
         install_zh = match detect_lang() {
             Lang::Zh => "安装动画包（自动识别 AOSP / ColorOS 格式）",
@@ -1865,6 +2265,18 @@ fn main() {
                 })
             }
         }
+        Some("once_apply") => {
+            if let Some(id) = sub.get(0) {
+                once_apply_cmd(&flags, id)
+            } else {
+                Err(match detect_lang() {
+                    Lang::Zh => "用法: utils once_apply <id>".into(),
+                    Lang::En => "usage: utils once_apply <id>".into(),
+                })
+            }
+        }
+        Some("enable") => enable_cmd(&flags),
+        Some("disable") => disable_cmd(&flags),
         Some("install") => {
             if let Some(z) = sub.get(0) {
                 install(&flags, z)
