@@ -874,7 +874,11 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
     let detected = detect_system_animation_ex();
     let sys = detected.as_ref().map(|(p, _)| p.clone());
     let format = detected.as_ref().map(|(_, is_oppo)| {
-        if *is_oppo { "coloros".to_string() } else { "aosp".to_string() }
+        if *is_oppo {
+            "coloros".to_string()
+        } else {
+            "aosp".to_string()
+        }
     });
 
     let moddir = mod_dir();
@@ -1269,6 +1273,7 @@ fn detect_resolution() -> (u32, u32) {
 /// - coloros = false：AOSP 格式  `W H FPS`
 /// - coloros = true ：ColorOS 格式 `g W H OFFX OFFY FPS`
 /// offset_x / offset_y 缺省填 0
+/// 末尾强制两个换行，模拟脚本里 echo 的隐式空行
 fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
     let fps = config.fps.unwrap_or(60);
     let mut d = if coloros {
@@ -1287,7 +1292,21 @@ fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
             p.path
         ));
     }
+    // 关键：末尾再补一个 \n 形成真正的空行
+    d.push('\n');
     d
+}
+
+/// 只允许 jpg / jpeg / png（大小写不敏感）
+/// 与脚本的 `find ... ! -iname "*.jpg" ! -iname "*.png" -delete` 等价
+fn is_image_file(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let e = ext.to_lowercase();
+            e == "jpg" || e == "jpeg" || e == "png"
+        }
+        None => false,
+    }
 }
 
 fn add_dir_to_zip(
@@ -1304,6 +1323,10 @@ fn add_dir_to_zip(
         if p.is_dir() {
             add_dir_to_zip(zip, &p, &format!("{}/", zp), opts)?;
         } else {
+            // 非图片文件直接跳过，不写进 zip
+            if !is_image_file(&p) {
+                continue;
+            }
             zip.start_file(&zp, opts).map_err(|e| e.to_string())?;
             let data = fs::read(&p).map_err(|e| e.to_string())?;
             zip.write_all(&data).map_err(|e| e.to_string())?;
@@ -1396,7 +1419,10 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
 
     // 用与挂载完全一致的路径探测判断当前系统格式
     let detected = detect_system_animation_ex();
-    let coloros = detected.as_ref().map(|(_, is_oppo)| *is_oppo).unwrap_or(false);
+    let coloros = detected
+        .as_ref()
+        .map(|(_, is_oppo)| *is_oppo)
+        .unwrap_or(false);
     let system_format = if coloros { "coloros" } else { "aosp" };
 
     if coloros {
@@ -1448,7 +1474,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
         }
 
         let info: Info = serde_json::from_str(
-            &fs::read_to_string(&info_path).map_err(|e| e.to_string())?
+            &fs::read_to_string(&info_path).map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("{} info.json {}", folder, e))?;
 
@@ -1491,7 +1517,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
         }
 
         let config: Config = serde_json::from_str(
-            &fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?
+            &fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("{} config.json {}", info.id, e))?;
 
