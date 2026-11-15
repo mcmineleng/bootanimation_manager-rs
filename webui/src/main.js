@@ -14,6 +14,7 @@ import "@mdui/icons/folder-zip.js";
 import "@mdui/icons/chevron-right.js";
 import "@mdui/icons/check-circle.js";
 import "@mdui/icons/error.js";
+import "@mdui/icons/power.js";
 
 // ==================== 常量 ====================
 const MODULE_ID = "bootanimation_manager";
@@ -21,6 +22,12 @@ const MODULE_DIR = `/data/adb/modules/${MODULE_ID}`;
 const UTILS_CMD = `cd ${MODULE_DIR} && MODDIR=${MODULE_DIR} ./utils`;
 
 const ksu = window.ksu || window.ksuwebui || {};
+
+const CLR = {
+  selectedBg: "#3b82f6",
+  selectedFg: "#ffffff",
+  selectedBgLight: "rgba(59,130,246,0.15)",
+};
 
 // ==================== DOM 辅助 ====================
 function el(tag, props = {}, children = []) {
@@ -83,6 +90,16 @@ function shAsync(cmd) {
   });
 }
 
+async function shRetry(cmd, validate = (r) => parseResult(r.stdout) !== null, attempts = 5, delay = 200) {
+  let r;
+  for (let i = 0; i < attempts; i++) {
+    r = await shAsync(cmd);
+    if (validate(r)) return r;
+    if (i < attempts - 1) await sleep(delay);
+  }
+  return r;
+}
+
 function shQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
@@ -95,12 +112,6 @@ function parseResult(raw) {
     if (t.startsWith("{")) { try { return JSON.parse(t); } catch (_) {} }
   }
   return null;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -118,7 +129,7 @@ const C = {
   wrap: { padding: "16px", maxWidth: "720px", margin: "0 auto" },
   title: { fontSize: "1.3rem", fontWeight: 600, marginBottom: "16px" },
   gap: { display: "flex", gap: "8px", flexWrap: "wrap" },
-  fileRow: { display: "flex", alignItems: "center", padding: "12px 8px", cursor: "pointer" },
+  fileRow: { display: "flex", alignItems: "center", padding: "12px 8px", cursor: "pointer", borderRadius: "8px" },
   overlay: {
     position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 9998,
     display: "flex", alignItems: "center", justifyContent: "center", padding: "24px",
@@ -138,11 +149,72 @@ const C = {
   },
 };
 
+// ==================== 电源菜单 ====================
+function showPowerMenu() {
+  const items = [
+    { label: "重启", cmd: "reboot" },
+    { label: "软重启", cmd: "ksud soft-reboot" },
+    { label: "重启到 Recovery", cmd: "reboot recovery" },
+    { label: "重启到 Bootloader", cmd: "reboot bootloader" },
+    { label: "重启到 EDL", cmd: "reboot edl" },
+    { label: "重启到 Download", cmd: "reboot download" },
+  ];
+
+  const overlay = el("div", {
+    style: { ...C.overlay, alignItems: "flex-end", padding: "0" },
+    on: { click: (e) => { if (e.target === overlay) overlay.remove(); } },
+  }, [
+    el("div", {
+      style: {
+        background: "rgb(var(--mdui-color-surface-container-high, 236, 233, 230))",
+        color: "rgb(var(--mdui-color-on-surface, 0, 0, 0))",
+        width: "100%",
+        borderRadius: "20px 20px 0 0",
+        padding: "12px 0 max(20px, env(safe-area-inset-bottom)) 0",
+        boxShadow: "0 -4px 24px rgba(0,0,0,0.3)",
+      },
+    }, [
+      el("div", {
+        style: {
+          width: "36px", height: "4px", borderRadius: "2px",
+          background: "var(--mdui-color-outline-variant, #cac4d0)",
+          margin: "0 auto 16px",
+        },
+      }),
+      el("div", { style: { fontSize: "0.85rem", fontWeight: 600, opacity: 0.6, padding: "0 20px 8px" }, text: "电源选项" }),
+      ...items.map(({ label, cmd }) =>
+        el("div", {
+          style: {
+            display: "flex", alignItems: "center",
+            padding: "15px 20px", cursor: "pointer", fontSize: "0.92rem",
+            WebkitTapHighlightColor: "transparent",
+          },
+          on: {
+            click: () => {
+              overlay.remove();
+              executePowerCommand(cmd, label);
+            },
+          },
+        }, [el("span", { text: label })])
+      ),
+    ]),
+  ]);
+
+  document.body.appendChild(overlay);
+}
+
+async function executePowerCommand(cmd, label) {
+  toast(`正在执行：${label}...`);
+  await sleep(300);
+  shAsync(cmd);
+  // 重启命令执行后设备会重启，WebView 不会返回，所以不刷新 UI
+}
+
 // ==================== 状态页 ====================
 async function refreshStatus() {
   const box = document.getElementById("status-content");
   box.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">读取中...</div>';
-  const { stdout } = await shAsync(`${UTILS_CMD} status --json`);
+  const { stdout } = await shRetry(`${UTILS_CMD} status --json`);
   const res = parseResult(stdout);
   if (!res || !res.success) {
     box.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">无法读取状态</div>';
@@ -219,12 +291,14 @@ async function refreshList() {
   const el_ = document.getElementById("anim-list");
   el_.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">加载中...</div>';
 
-  const [listRes, infoRes] = await Promise.all([
-    shAsync(`${UTILS_CMD} list --json`),
-    shAsync(`${UTILS_CMD} info --json`),
+  const [listRes, infoRes, statusRes] = await Promise.all([
+    shRetry(`${UTILS_CMD} list --json`),
+    shRetry(`${UTILS_CMD} info --json`),
+    shRetry(`${UTILS_CMD} status --json`),
   ]);
   const list = parseResult(listRes.stdout);
   const info = parseResult(infoRes.stdout);
+  const status = parseResult(statusRes.stdout);
 
   if (!list || !list.success || !list.data || !list.data.animations || list.data.animations.length === 0) {
     el_.innerHTML = '<div style="text-align:center;padding:24px;opacity:0.4;font-size:0.85rem;">没有已安装的动画</div>';
@@ -236,59 +310,99 @@ async function refreshList() {
     for (const m of info.data.info) if (m && m.id) metaMap[m.id] = m;
   }
 
-  const statusRes = await shAsync(`${UTILS_CMD} status --json`);
-  const status = parseResult(statusRes.stdout);
   const configId = status && status.data ? (status.data.config_animation_id || status.data.animation_id || null) : null;
   const nowId = status && status.data ? (status.data.now_animation_id || null) : null;
 
+  const all = list.data.animations;
+  const ordered = [];
+  const added = new Set();
+  if (configId) {
+    const c = all.find(a => a.id === configId);
+    if (c) { ordered.push(c); added.add(c.id); }
+  }
+  if (nowId && !added.has(nowId)) {
+    const n = all.find(a => a.id === nowId);
+    if (n) { ordered.push(n); added.add(n.id); }
+  }
+  all.forEach(a => { if (!added.has(a.id)) ordered.push(a); });
+
   el_.innerHTML = "";
-  list.data.animations.forEach(item => {
+  ordered.forEach(item => {
     const m = metaMap[item.id] || {};
     const isDefault = configId === item.id;
     const isNow = nowId === item.id;
 
-    const titleWrap = el("div", { style: { display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" } }, [
-      el("mdui-icon-chevron-right", { class: "chevron", style: {
-        fontSize: "18px", transition: "transform 0.15s", transform: "rotate(90deg)",
-      } }),
-      el("span", { text: item.name || item.id }),
-    ]);
-    if (isDefault) titleWrap.appendChild(el("span", { style: C.badge("#7c3aed", "#e9d5ff") }, ["默认"]));
-    if (isNow) titleWrap.appendChild(el("span", { style: C.badge("#166534", "#86efac") }, ["当前挂载"]));
+    const versionNode = m.version
+      ? (m.version_code
+          ? el("span", {}, [
+              m.version, " ",
+              el("span", { style: { opacity: 0.5 }, text: `(${m.version_code})` }),
+            ])
+          : m.version)
+      : null;
 
-    const rows = [
+    const metaRows = [
       ["作者", m.author],
-      ["版本", m.version ? `${m.version}${m.version_code ? ` (${m.version_code})` : ""}` : null],
+      ["版本", versionNode],
       ["描述", m.desc],
       ["ID", item.id],
     ].filter(([, v]) => v !== undefined && v !== null && v !== "");
 
     const meta = el("div", {
-      id: `meta-${item.id}`,
-      style: { marginTop: "10px", padding: "10px", background: "var(--mdui-color-surface-variant)", borderRadius: "8px", fontSize: "0.8rem" },
-    }, rows.length ? rows.map(([k, v]) => el("div", { style: { display: "flex", gap: "8px", padding: "3px 0" } }, [
-      el("span", { style: { opacity: 0.6, minWidth: "64px", flexShrink: 0 }, text: k }),
-      el("span", { style: { wordBreak: "break-word" }, text: String(v) }),
-    ])) : [el("div", { style: C.muted, text: "无更多元数据" })]);
+      style: {
+        marginTop: "10px", padding: "10px",
+        background: "var(--mdui-color-surface-variant)",
+        borderRadius: "8px", fontSize: "0.8rem",
+      },
+    }, metaRows.length
+      ? metaRows.map(([k, v]) => el("div", { style: { display: "flex", gap: "8px", padding: "3px 0" } }, [
+          el("span", { style: { opacity: 0.6, minWidth: "64px", flexShrink: 0 }, text: k }),
+          el("span", { style: { wordBreak: "break-word" } }, [v]),
+        ]))
+      : [el("div", { style: C.muted, text: "无更多元数据" })]);
+
+    const titleRow = el("div", {
+      style: {
+        display: "flex", alignItems: "center", gap: "6px",
+        flexWrap: "wrap", cursor: "pointer", userSelect: "none",
+      },
+      on: { click: () => {
+        const isHidden = meta.style.display === "none";
+        meta.style.display = isHidden ? "block" : "none";
+        const icon = card.querySelector(".chevron");
+        if (icon) icon.style.transform = isHidden ? "rotate(90deg)" : "";
+      } },
+    }, [
+      el("mdui-icon-chevron-right", { class: "chevron", style: {
+        fontSize: "18px", transition: "transform 0.15s", transform: "rotate(90deg)",
+      } }),
+      el("span", { style: { fontWeight: 500 }, text: item.name || item.id }),
+    ]);
+    if (isDefault) titleRow.appendChild(el("span", { style: C.badge("#7c3aed", "#e9d5ff") }, ["默认"]));
+    else if (isNow) titleRow.appendChild(el("span", { style: C.badge("#166534", "#86efac") }, ["当前挂载"]));
+
+    const actionBtn = isDefault
+      ? el("mdui-button", { variant: "filled", disabled: true, style: { fontSize: "0.78rem" }, text: "使用中" })
+      : isNow
+        ? el("mdui-button", { variant: "filled", disabled: true, style: { fontSize: "0.78rem" }, text: "当前" })
+        : el("mdui-button", { variant: "filled", style: { fontSize: "0.78rem" }, text: "使用", on: { click: () => useAnimation(item.id) } });
+
+    const actionRow = el("div", {
+      style: { display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "12px" },
+    }, [
+      actionBtn,
+      el("mdui-button", { variant: "outlined", style: { fontSize: "0.78rem" }, text: "预览", on: { click: () => previewAnimation(item.id) } }),
+      el("mdui-button", { variant: "outlined", style: { fontSize: "0.78rem" }, text: "用一次", on: { click: () => onceApply(item.id) } }),
+      el("mdui-button", {
+        variant: "text",
+        style: { fontSize: "0.78rem", color: "#f87171" },
+        text: "删除",
+        on: { click: () => removeAnimation(item.id, item.name || item.id) },
+      }),
+    ]);
 
     const card = el("mdui-card", { style: { width: "100%", marginBottom: "12px" } }, [
-      el("div", { style: { padding: "14px" } }, [
-        el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px" } }, [
-          el("div", { style: { flex: 1, minWidth: 0 }, on: { click: () => {
-            const open = meta.style.display === "none";
-            meta.style.display = open ? "block" : "none";
-            const icon = card.querySelector(".chevron");
-            if (icon) icon.style.transform = open ? "rotate(90deg)" : "";
-          } } }, [titleWrap]),
-          el("div", { style: { display: "flex", gap: "6px", flexShrink: 0, flexWrap: "wrap" } }, [
-            el("mdui-button", { variant: "filled", style: { fontSize: "0.78rem" }, text: "设为默认", on: { click: () => useAnimation(item.id) } }),
-            el("mdui-button", { variant: "outlined", style: { fontSize: "0.78rem" }, text: "临时挂载", on: { click: () => applyTemp(item.id) } }),
-            el("mdui-button", { variant: "outlined", style: { fontSize: "0.78rem" }, text: "预览", on: { click: () => previewAnimation(item.id) } }),
-            el("mdui-button", { variant: "text", style: { fontSize: "0.78rem" }, text: "用一次", on: { click: () => onceApply(item.id) } }),
-          ]),
-        ]),
-        meta,
-      ]),
+      el("div", { style: { padding: "14px" } }, [titleRow, meta, actionRow]),
     ]);
     el_.appendChild(card);
   });
@@ -299,16 +413,8 @@ async function useAnimation(id) {
   toast(`正在设置 ${id}...`);
   const { stdout, stderr } = await shAsync(`${UTILS_CMD} use ${shQuote(id)} --json`);
   const res = parseResult(stdout);
-  if (res && res.success) { toast(`已设为默认：${id}`); refreshStatus(); refreshList(); }
+  if (res && res.success) { toast(`已使用：${id}`); refreshStatus(); refreshList(); }
   else toast(res?.error || stderr || "设置失败");
-}
-
-async function applyTemp(id) {
-  toast(`正在临时挂载 ${id}...`);
-  const { stdout, stderr } = await shAsync(`${UTILS_CMD} apply --temp ${shQuote(id)} --json`);
-  const res = parseResult(stdout);
-  if (res && res.success) { toast(`已临时挂载：${id}（重启后失效）`); refreshStatus(); refreshList(); }
-  else toast(res?.error || stderr || "临时挂载失败");
 }
 
 async function onceApply(id) {
@@ -317,6 +423,21 @@ async function onceApply(id) {
   const res = parseResult(stdout);
   if (res && res.success) { toast(`下次开机使用 ${id}，之后恢复默认`); refreshStatus(); refreshList(); }
   else toast(res?.error || stderr || "设置失败");
+}
+
+async function removeAnimation(id, displayName) {
+  const ok = await showConfirmDialog({
+    title: "删除动画",
+    message: `确定要删除「${displayName || id}」吗？此操作不可撤销。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  toast(`正在删除 ${id}...`);
+  const { stdout, stderr } = await shAsync(`${UTILS_CMD} remove ${shQuote(id)} --json`);
+  const res = parseResult(stdout);
+  if (res && res.success) { toast(`已删除：${id}`); refreshStatus(); refreshList(); }
+  else toast(res?.error || stderr || "删除失败");
 }
 
 async function applyCurrent() {
@@ -338,7 +459,7 @@ async function revert() {
 }
 
 async function check() {
-  const { stdout } = await shAsync(`${UTILS_CMD} check --json`);
+  const { stdout } = await shRetry(`${UTILS_CMD} check --json`);
   const res = parseResult(stdout);
   if (res && res.success && res.data) showCheckDialog(res.data);
   else toast("检查失败");
@@ -381,6 +502,28 @@ function showCheckDialog(d) {
     ]),
   ]);
   document.body.appendChild(overlay);
+}
+
+// ==================== 通用确认对话框 ====================
+function showConfirmDialog({ title, message, confirmText = "确定", cancelText = "取消", danger = false }) {
+  return new Promise((resolve) => {
+    const overlay = el("div", { style: C.overlay, on: { click: (e) => { if (e.target === overlay) { overlay.remove(); resolve(false); } } } }, [
+      el("div", { style: C.dialog }, [
+        el("div", { style: { fontSize: "1.05rem", fontWeight: 600, marginBottom: "10px" }, text: title }),
+        el("div", { style: { fontSize: "0.85rem", opacity: 0.8, marginBottom: "18px", lineHeight: 1.5, wordBreak: "break-word" }, text: message }),
+        el("div", { style: { display: "flex", justifyContent: "flex-end", gap: "8px" } }, [
+          el("mdui-button", { variant: "text", text: cancelText, on: { click: () => { overlay.remove(); resolve(false); } } }),
+          el("mdui-button", {
+            variant: "filled",
+            text: confirmText,
+            style: danger ? { background: "#dc2626", color: "#fff" } : {},
+            on: { click: () => { overlay.remove(); resolve(true); } },
+          }),
+        ]),
+      ]),
+    ]);
+    document.body.appendChild(overlay);
+  });
 }
 
 // ==================== 预览功能 ====================
@@ -449,17 +592,31 @@ const FilePicker = {
   selected: null,
 
   init() {
-    document.getElementById("btn-up").addEventListener("click", () => this.goUp());
     document.getElementById("btn-confirm").addEventListener("click", () => this.confirm());
+    this.updateConfirm();
     this.load(this.currentPath);
   },
 
   updateConfirm() {
     const btn = document.getElementById("btn-confirm");
     btn.disabled = !this.selected;
-    btn.textContent = this.selected
-      ? `安装：${this.selected.split("/").pop()}`
-      : "安装选中文件";
+    btn.textContent = "安装选中文件";
+    const pathEl = document.getElementById("install-selected-path");
+    if (pathEl) {
+      if (this.selected) {
+        pathEl.textContent = `已选择：${this.selected}`;
+        pathEl.style.opacity = "1";
+        pathEl.style.background = CLR.selectedBgLight;
+        pathEl.style.color = CLR.selectedBg;
+        pathEl.style.border = `1px solid ${CLR.selectedBg}`;
+      } else {
+        pathEl.textContent = "未选择文件";
+        pathEl.style.opacity = "0.6";
+        pathEl.style.background = "transparent";
+        pathEl.style.color = "inherit";
+        pathEl.style.border = "1px dashed var(--mdui-color-outline, #79747e)";
+      }
+    }
   },
 
   async load(path) {
@@ -468,7 +625,10 @@ const FilePicker = {
     body.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">读取目录...</div>';
     pathEl.textContent = path;
 
-    const { stdout, errno } = await shAsync(`LC_ALL=C ls -1pL ${shQuote(path)} 2>/dev/null`);
+    const { stdout, errno } = await shRetry(
+      `LC_ALL=C ls -1pL ${shQuote(path)} 2>/dev/null`,
+      r => r.errno === 0
+    );
     if (errno !== 0 || !stdout.trim()) {
       body.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">目录为空或无法读取</div>';
       this.currentPath = path;
@@ -482,35 +642,68 @@ const FilePicker = {
     const visible = arr => arr.filter(n => !n.startsWith("."));
 
     const frag = document.createDocumentFragment();
+
+    if (path !== "/" && path !== "") {
+      const parent = path.replace(/\/+$/, "").split("/").slice(0, -1).join("/") || "/";
+      frag.appendChild(el("div", {
+        class: "file-row", style: C.fileRow,
+        on: { click: () => {
+          this.selected = null;
+          this.updateConfirm();
+          this.load(parent);
+        } },
+      }, [
+        el("mdui-icon-folder", { style: { marginRight: "10px", color: "var(--mdui-color-outline, #79747e)" } }),
+        el("span", { style: { fontSize: "0.88rem", flex: 1, wordBreak: "break-all", opacity: 0.7 }, text: ".." }),
+      ]));
+    }
+
     visible(dirs).forEach(d => {
       const name = d.slice(0, -1);
       frag.appendChild(el("div", {
-        class: "file-row", style: C.fileRow, dataset: { dir: name },
+        class: "file-row", style: C.fileRow,
         on: { click: () => {
           this.selected = null;
           this.updateConfirm();
           this.load(`${this.currentPath.replace(/\/+$/, "")}/${name}`);
         } },
       }, [
-        el("mdui-icon-folder", { style: { marginRight: "10px", color: "var(--mdui-color-primary)" } }),
+        el("mdui-icon-folder", { style: { marginRight: "10px", color: "var(--mdui-color-primary, #6750a4)" } }),
         el("span", { style: { fontSize: "0.88rem", flex: 1, wordBreak: "break-all" }, text: name }),
       ]));
     });
+
     visible(files).forEach(f => {
       if (!f.toLowerCase().endsWith(".zip")) return;
-      frag.appendChild(el("div", {
-        class: "file-row", style: C.fileRow, dataset: { file: f },
+      const fullPath = `${this.currentPath.replace(/\/+$/, "")}/${f}`;
+      const isSelected = this.selected === fullPath;
+
+      const row = el("div", {
+        class: "file-row",
+        style: {
+          ...C.fileRow,
+          background: isSelected ? CLR.selectedBg : "transparent",
+          color: isSelected ? CLR.selectedFg : "inherit",
+        },
         on: { click: (e) => {
-          e.currentTarget.parentElement.querySelectorAll(".file-row").forEach(r => { r.style.background = ""; });
-          e.currentTarget.style.background = "var(--mdui-color-secondary-container)";
-          this.selected = `${this.currentPath.replace(/\/+$/, "")}/${f}`;
+          e.currentTarget.parentElement.querySelectorAll(".file-row").forEach(r => {
+            r.style.background = "transparent";
+            r.style.color = "inherit";
+          });
+          e.currentTarget.style.background = CLR.selectedBg;
+          e.currentTarget.style.color = CLR.selectedFg;
+          this.selected = fullPath;
           this.updateConfirm();
         } },
       }, [
-        el("mdui-icon-folder-zip", { style: { marginRight: "10px", color: "var(--mdui-color-tertiary)" } }),
+        el("mdui-icon-folder-zip", { style: {
+          marginRight: "10px",
+          color: isSelected ? CLR.selectedFg : "var(--mdui-color-tertiary, #7d5260)",
+        } }),
         el("span", { style: { fontSize: "0.88rem", flex: 1, wordBreak: "break-all" }, text: f }),
-        el("span", { style: { fontSize: "0.72rem", opacity: 0.5 }, text: "ZIP" }),
-      ]));
+        el("span", { style: { fontSize: "0.72rem", opacity: isSelected ? 0.85 : 0.5 }, text: "ZIP" }),
+      ]);
+      frag.appendChild(row);
     });
 
     body.innerHTML = "";
@@ -519,12 +712,6 @@ const FilePicker = {
     } else {
       body.appendChild(frag);
     }
-  },
-
-  goUp() {
-    if (this.currentPath === "/" || this.currentPath === "") return;
-    const parent = this.currentPath.replace(/\/+$/, "").split("/").slice(0, -1).join("/") || "/";
-    this.load(parent);
   },
 
   async confirm() {
@@ -566,10 +753,27 @@ function switchPage(name) {
 function buildApp() {
   const app = el("div", { id: "app" });
 
-  // 状态页
+  // 状态页标题行（右侧电源按钮）
+  const statusTitle = el("div", {
+    style: {
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+      marginBottom: "16px",
+    },
+  }, [
+    el("div", { style: C.title, text: "状态" }),
+    el("mdui-button", {
+      variant: "text",
+      style: { minWidth: "auto", padding: "8px 10px" },
+      title: "电源菜单",
+      on: { click: showPowerMenu },
+    }, [
+      el("mdui-icon-power", { style: { fontSize: "24px" } }),
+    ]),
+  ]);
+
   app.appendChild(el("div", { class: "page active", id: "page-status" }, [
     el("div", { style: C.wrap }, [
-      el("div", { style: C.title, text: "状态" }),
+      statusTitle,
       el("mdui-card", { style: { width: "100%", marginBottom: "16px" } }, [
         el("div", { style: { padding: "16px" }, id: "status-content", text: "读取中..." }),
       ]),
@@ -596,11 +800,21 @@ function buildApp() {
   app.appendChild(el("div", { class: "page", id: "page-install" }, [
     el("div", { style: C.wrap }, [
       el("div", { style: C.title, text: "安装动画包" }),
-      el("div", { id: "install-path", style: { fontSize: "0.78rem", fontFamily: "monospace", opacity: 0.7, wordBreak: "break-all", marginBottom: "8px" }, text: "/sdcard" }),
-      el("div", { style: C.gap }, [
-        el("mdui-button", { variant: "outlined", id: "btn-up", style: { flex: "0 0 auto" }, text: "上一级" }),
-        el("mdui-button", { variant: "filled", id: "btn-confirm", style: { flex: 1 }, disabled: true, text: "安装选中文件" }),
-      ]),
+      el("div", { id: "install-path", style: {
+        fontSize: "0.78rem", fontFamily: "monospace", opacity: 0.7,
+        wordBreak: "break-all", marginBottom: "8px",
+      }, text: "/sdcard" }),
+      el("mdui-button", {
+        variant: "filled", id: "btn-confirm",
+        style: { width: "100%" }, disabled: true, text: "安装选中文件",
+      }),
+      el("div", { id: "install-selected-path", style: {
+        fontSize: "0.78rem", fontFamily: "monospace", opacity: 0.6,
+        wordBreak: "break-all", marginTop: "8px",
+        padding: "8px 10px", borderRadius: "8px",
+        border: "1px dashed var(--mdui-color-outline, #79747e)",
+        transition: "all 0.15s",
+      }, text: "未选择文件" }),
       el("div", { id: "install-body", style: { marginTop: "12px" } }, [
         el("div", { style: { textAlign: "center", padding: "20px", opacity: 0.5 }, text: "加载中..." }),
       ]),
@@ -609,7 +823,7 @@ function buildApp() {
 
   document.body.appendChild(app);
 
-  // 导航栏
+  // 底部导航栏
   document.body.appendChild(el("mdui-navigation-bar", {
     value: "status", id: "bottom-nav", "label-visibility": "labeled",
     on: { change: (e) => switchPage(e.target.value) },
