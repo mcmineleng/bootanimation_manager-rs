@@ -241,6 +241,25 @@ fn bind_unmount(dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("unmount 失败 {}: {:?}", dst.display(), e))
 }
 
+/// 强制卸载目标路径上的所有挂载层（不论是谁挂的）。
+/// 循环最多 8 次，每次先普通 unmount，失败再 MNT_DETACH。
+/// 每次都重新检测 is_mounted，确保多层叠加也能清空。
+fn force_unmount_all(target: &str) {
+    let p = Path::new(target);
+    for _ in 0..8 {
+        if !is_mounted(target).unwrap_or(false) {
+            return;
+        }
+        if unmount(p, UnmountFlags::empty()).is_err() {
+            // 兜底：lazy detach，对 busy 的挂载也有效
+            if unmount(p, UnmountFlags::MNT_DETACH).is_err() {
+                // 连 detach 都失败，退出避免死循环
+                return;
+            }
+        }
+    }
+}
+
 // ============================================================
 // 动画枚举 / 校验
 // ============================================================
@@ -591,27 +610,19 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
         }
     };
 
-    if is_mounted(&sys)? {
+    // 无论当前是否被挂载（包括用户手动挂的测试挂载），先清空所有层，
+    // 避免"已挂载"导致跳过或叠加挂载失败。
+    if is_mounted(&sys).unwrap_or(false) {
+        force_unmount_all(&sys);
         let msg = format!(
             "{}: {}",
             match detect_lang() {
-                Lang::Zh => "已挂载，跳过",
-                Lang::En => "already mounted, skipping",
+                Lang::Zh => "已清理旧挂载",
+                Lang::En => "cleared existing mount",
             },
             sys
         );
         log_info(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult {
-                success: true,
-                data: Some(ApplyData {
-                    animation_id: Some(id),
-                    message: msg,
-                }),
-                error: None,
-            })?;
-        }
-        return Ok(());
     }
 
     bind_mount(&zip_path, Path::new(&sys))?;
@@ -624,6 +635,9 @@ fn apply(flags: &GlobalFlags) -> Result<(), String> {
 
     let mut dark_done = false;
     if let Some(dark) = dark_animation_path(&sys) {
+        if is_mounted(&dark).unwrap_or(false) {
+            force_unmount_all(&dark);
+        }
         if bind_mount(&zip_path, Path::new(&dark)).is_ok() {
             let ok_dark = match detect_lang() {
                 Lang::Zh => format!("已挂载 dark: {} -> {}", zip_path.display(), dark),
@@ -712,29 +726,18 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
         }
     };
 
-    if is_mounted(&sys)? {
+    // 无论是否已被挂载，先清空所有层再挂，避免叠加/占用导致失败。
+    if is_mounted(&sys).unwrap_or(false) {
+        force_unmount_all(&sys);
         let msg = format!(
             "{}: {}",
             match detect_lang() {
-                Lang::Zh => "系统动画已被挂载，请先卸载",
-                Lang::En => "system animation already mounted, revert first",
+                Lang::Zh => "已清理旧挂载",
+                Lang::En => "cleared existing mount",
             },
             sys
         );
-        log_error(flags, &msg);
-        if flags.json {
-            json_output(&CmdResult {
-                success: false,
-                data: Some(ApplyTempData {
-                    animation_id: id.to_string(),
-                    message: msg.clone(),
-                    main_mounted: false,
-                    dark_mounted: false,
-                }),
-                error: Some(msg),
-            })?;
-        }
-        return Ok(());
+        log_info(flags, &msg);
     }
 
     bind_mount(&zip_path, Path::new(&sys))?;
@@ -747,6 +750,9 @@ fn apply_temp(flags: &GlobalFlags, id: &str) -> Result<(), String> {
 
     let mut dark_mounted = false;
     if let Some(dark) = dark_animation_path(&sys) {
+        if is_mounted(&dark).unwrap_or(false) {
+            force_unmount_all(&dark);
+        }
         if bind_mount(&zip_path, Path::new(&dark)).is_ok() {
             let ok_dark = match detect_lang() {
                 Lang::Zh => format!("已临时挂载 dark: {} -> {}", zip_path.display(), dark),
@@ -820,7 +826,8 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
     let mut unmounted = Vec::new();
 
     if is_mounted(&sys)? {
-        bind_unmount(Path::new(&sys))?;
+        // revert 也改用 force_unmount_all，确保多层叠加全部清空
+        force_unmount_all(&sys);
         let ok_msg = match detect_lang() {
             Lang::Zh => format!("已卸载: {}", sys),
             Lang::En => format!("unmounted: {}", sys),
@@ -831,7 +838,7 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
 
     if let Some(dark) = dark_animation_path(&sys) {
         if is_mounted(&dark)? {
-            let _ = bind_unmount(Path::new(&dark));
+            force_unmount_all(&dark);
             let ok_msg = match detect_lang() {
                 Lang::Zh => format!("已卸载: {}", dark),
                 Lang::En => format!("unmounted: {}", dark),
@@ -1309,6 +1316,14 @@ fn is_image_file(path: &Path) -> bool {
     }
 }
 
+// ============================================================
+// 关键修复：显式写入目录条目
+//
+// Android（尤其 ColorOS）的 bootanimation 解析器在解析 desc.txt
+// 的 part 路径时会依赖显式目录条目，缺失时行为异常。
+// 这里进入每个子目录前先 `add_directory("<name>/")`，
+// 使生成的 ZIP 结构和 `zip -rq -0 out.zip *` 完全一致。
+// ============================================================
 fn add_dir_to_zip(
     zip: &mut zip_crate::ZipWriter<fs::File>,
     dir: &Path,
@@ -1321,6 +1336,9 @@ fn add_dir_to_zip(
         let name = p.file_name().unwrap().to_string_lossy();
         let zp = format!("{}{}", prefix, name);
         if p.is_dir() {
+            // 显式写目录条目，以 / 结尾
+            zip.add_directory(format!("{}/", zp), opts)
+                .map_err(|e| e.to_string())?;
             add_dir_to_zip(zip, &p, &format!("{}/", zp), opts)?;
         } else {
             // 非图片文件直接跳过，不写进 zip
@@ -1368,6 +1386,9 @@ fn make_zip(
         let p = e.path();
         if p.is_dir() {
             let n = p.file_name().unwrap().to_string_lossy();
+            // 关键修复：入口 part 目录本身也要写显式目录条目
+            zip.add_directory(format!("{}/", n), opts)
+                .map_err(|e| e.to_string())?;
             add_dir_to_zip(&mut zip, &p, &format!("{}/", n), opts)?;
         }
     }
@@ -1531,7 +1552,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
                     was_active = true;
                     if let Some(sys) = detect_system_animation() {
                         if is_mounted(&sys).unwrap_or(false) {
-                            let _ = bind_unmount(Path::new(&sys));
+                            force_unmount_all(&sys);
                             let ok = format!(
                                 "{}: {}",
                                 match detect_lang() {
@@ -1544,7 +1565,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
                         }
                         if let Some(dark) = dark_animation_path(&sys) {
                             if is_mounted(&dark).unwrap_or(false) {
-                                let _ = bind_unmount(Path::new(&dark));
+                                force_unmount_all(&dark);
                             }
                         }
                     }
@@ -1741,16 +1762,16 @@ fn print_help(prog: &str) {
         cmd = c,
         opt = o,
         apply_zh = match detect_lang() {
-            Lang::Zh => "挂载 bootanimation.txt 中指定的动画",
-            Lang::En => "mount animation specified in bootanimation.txt",
+            Lang::Zh => "挂载 bootanimation.txt 中指定的动画（会先清理旧挂载）",
+            Lang::En => "mount animation specified in bootanimation.txt (clears old mounts first)",
         },
         temp_zh = match detect_lang() {
-            Lang::Zh => "临时挂载指定动画（不写文件，重启失效）",
-            Lang::En => "temporarily mount an animation (no write, lost on reboot)",
+            Lang::Zh => "临时挂载指定动画（不写文件，重启失效，会先清理旧挂载）",
+            Lang::En => "temporarily mount an animation (no write, lost on reboot, clears old mounts first)",
         },
         revert_zh = match detect_lang() {
-            Lang::Zh => "卸载开机动画",
-            Lang::En => "unmount boot animation",
+            Lang::Zh => "卸载开机动画（含多层叠加）",
+            Lang::En => "unmount boot animation (all stacked layers)",
         },
         status_zh = match detect_lang() {
             Lang::Zh => "查看挂载状态",

@@ -56,6 +56,10 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 // ==================== 状态页 ====================
 async function refreshStatus() {
   const el = document.getElementById("status-content");
@@ -160,7 +164,7 @@ async function refreshList() {
   });
 
   el.querySelectorAll("[data-use]").forEach(b => b.onclick = () => useAnimation(b.dataset.use));
-  el.querySelectorAll("[data-temp]").forEach(b => b.onclick = () => applyTemp(b.dataset.temp));
+  el.querySelectorAll("[data-temp]").forEach(b => b.onclick = () => previewAnimation(b.dataset.temp));
 }
 
 // ==================== 操作 ====================
@@ -170,14 +174,6 @@ async function useAnimation(id) {
   const res = parseResult(stdout);
   if (res && res.success) { toast(`已设为默认：${id}`); refreshStatus(); }
   else toast(res?.error || stderr || "设置失败");
-}
-
-async function applyTemp(id) {
-  toast(`临时挂载 ${id}...`);
-  const { stdout, stderr } = await shAsync(`${UTILS_CMD} apply --temp ${shQuote(id)} --json`);
-  const res = parseResult(stdout);
-  if (res && res.success) { toast("已临时挂载（重启失效）"); refreshStatus(); }
-  else toast(res?.error || stderr || "挂载失败");
 }
 
 async function applyCurrent() {
@@ -203,6 +199,88 @@ async function check() {
   const res = parseResult(stdout);
   if (res && res.success) toast(res.data.message);
   else toast("检查失败");
+}
+
+// ==================== 预览功能 ====================
+function showPreviewDialog(id) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;display:flex;align-items:center;justify-content:center;padding:24px;";
+
+    const dialog = document.createElement("div");
+    dialog.style.cssText = "background:rgb(var(--mdui-color-surface-container-high, 236, 233, 230));color:rgb(var(--mdui-color-on-surface, 0, 0, 0));border-radius:16px;padding:20px;width:100%;max-width:320px;box-shadow:0 8px 32px rgba(0,0,0,0.5);";
+
+    dialog.innerHTML = `
+      <div style="font-size:1.05rem;font-weight:600;margin-bottom:8px;">预览动画</div>
+      <div style="font-size:0.8rem;opacity:0.6;margin-bottom:14px;word-break:break-all;font-family:monospace;">${escapeHtml(id)}</div>
+      <div style="font-size:0.82rem;opacity:0.75;margin-bottom:8px;">输入预览秒数（0 = 无限，按音量键退出）</div>
+      <input id="preview-seconds" type="number" inputmode="numeric" value="0" min="0"
+        style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid rgb(var(--mdui-color-outline, 121, 116, 126));background:rgb(var(--mdui-color-surface-container-lowest, 255, 255, 255));color:rgb(var(--mdui-color-on-surface, 0, 0, 0));font-size:0.95rem;font-family:monospace;outline:none;" />
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+        <mdui-button variant="text" id="preview-cancel">取消</mdui-button>
+        <mdui-button variant="filled" id="preview-ok">开始预览</mdui-button>
+      </div>
+    `;
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const input = dialog.querySelector("#preview-seconds");
+    setTimeout(() => { input.focus(); input.select(); }, 50);
+
+    const close = (result) => {
+      overlay.remove();
+      resolve(result);
+    };
+
+    dialog.querySelector("#preview-cancel").onclick = () => close(null);
+    overlay.onclick = (e) => { if (e.target === overlay) close(null); };
+
+    const confirm = () => {
+      const raw = input.value.trim();
+      // 空值或非数字统一按 0（无限）处理
+      let num = parseInt(raw, 10);
+      if (isNaN(num) || num < 0) num = 0;
+      close(num);
+    };
+
+    dialog.querySelector("#preview-ok").onclick = confirm;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); confirm(); }
+      if (e.key === "Escape") close(null);
+    };
+  });
+}
+
+async function previewAnimation(id) {
+  const seconds = await showPreviewDialog(id);
+  if (seconds === null) return; // 用户取消
+
+  // 1. 先临时挂载指定动画（否则 action.sh 播放的是当前默认动画）
+  toast(`正在挂载 ${id}...`);
+  const { stdout, stderr } = await shAsync(`${UTILS_CMD} apply --temp ${shQuote(id)} --json`);
+  const res = parseResult(stdout);
+  if (!res || !res.success) {
+    toast(res?.error || stderr || "临时挂载失败，已取消预览");
+    return;
+  }
+
+  // 2. 倒计时 3 秒
+  toast("3 秒后开始预览...");
+  await sleep(1000);
+  toast("2...");
+  await sleep(1000);
+  toast("1...");
+  await sleep(1000);
+
+  // 3. 执行 action.sh（不 await —— 无限预览需按音量键退出，可能很久才返回）
+  toast(`正在预览 ${id}（${seconds === 0 ? "无限，按音量键退出" : seconds + " 秒"}）`);
+  shAsync(`cd ${shQuote(MODULE_DIR)} && MODDIR=${shQuote(MODULE_DIR)} sh action.sh ${shQuote(String(seconds))}`)
+    .then(() => {
+      // 预览退出后恢复用户配置的默认动画
+      return shAsync(`${UTILS_CMD} apply --json`);
+    })
+    .then(() => refreshStatus());
 }
 
 // ==================== 安装页文件选择 ====================
