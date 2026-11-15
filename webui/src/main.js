@@ -1,6 +1,6 @@
 // ============================================================
 // 开机动画管理器 · WebUI
-// 纯 JS 动态构建 DOM，HTML 仅保留空壳
+// 纯 JS 动态构建 DOM，HTML 仅保留空壳 + 页面切换样式
 // ============================================================
 
 import "mdui/mdui.css";
@@ -166,8 +166,8 @@ async function refreshStatus() {
   }
 
   const format = d.system_format === "coloros"
-    ? "ColorOS（g 格式）"
-    : d.system_path ? "AOSP（标准）" : "未检测到";
+    ? "ColorOS"
+    : d.system_path ? "AOSP" : "未检测到";
 
   const enableSwitch = el("mdui-switch", {
     id: "switch-enable",
@@ -186,13 +186,16 @@ async function refreshStatus() {
     ["挂载模式", el("span", { style: modeBadge }, [mode])],
     ["开机自动挂载", enableSwitch],
     ["系统格式", format],
-    ["系统路径", el("span", { style: C.mono, text: d.system_path || "(未检测到)" })],
+    ["系统路径", el("span", {
+      style: { ...C.mono, wordBreak: "break-all", whiteSpace: "pre-wrap" },
+      text: d.system_path || "(未检测到)",
+    })],
     ["当前生效动画", el("span", { style: C.mono, text: nowId || "(未挂载)" })],
     ["持久化默认", el("span", { style: C.mono, text: configId || "(未设置)" })],
     ["界面语言", d.language || "默认（跟随系统）"],
     ["模块文件", d.module_file_exists ? "存在" : "缺失"],
     ["挂载源", d.main_sources && d.main_sources.length
-      ? el("span", { style: C.mono, text: d.main_sources.join(", ") })
+      ? el("span", { style: { ...C.mono, wordBreak: "break-all" }, text: d.main_sources.join(", ") })
       : "无"],
   ];
 
@@ -244,20 +247,14 @@ async function refreshList() {
     const isDefault = configId === item.id;
     const isNow = nowId === item.id;
 
-    const badges = [];
-    if (isDefault) badges.push(el("span", { style: C.badge("#7c3aed", "#e9d5ff") }, ["默认"]));
-    if (isNow) badges.push(el("span", { style: C.badge("#166534", "#86efac") }, ["当前挂载"]));
-    if (!isDefault && !isNow && nowId && nowId !== configId && isNow) badges.push(null);
-
     const titleWrap = el("div", { style: { display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" } }, [
       el("mdui-icon-chevron-right", { class: "chevron", style: {
         fontSize: "18px", transition: "transform 0.15s", transform: "rotate(90deg)",
       } }),
       el("span", { text: item.name || item.id }),
     ]);
-    if (badges.length) {
-      badges.forEach(b => b && titleWrap.appendChild(b));
-    }
+    if (isDefault) titleWrap.appendChild(el("span", { style: C.badge("#7c3aed", "#e9d5ff") }, ["默认"]));
+    if (isNow) titleWrap.appendChild(el("span", { style: C.badge("#166534", "#86efac") }, ["当前挂载"]));
 
     const rows = [
       ["作者", m.author],

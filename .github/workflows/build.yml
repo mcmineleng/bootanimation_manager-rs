@@ -2,6 +2,17 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      zip_level:
+        description: 'ZIP_LEVEL (no = 目录输出, 1-9 = 压缩)'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - '1'
+          - '5'
+          - '9'
 
 jobs:
   build:
@@ -10,7 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. 安装 Rust 工具链 (cargo, rustc) + 交叉编译目标
+      # 1. 安装 Rust 工具链 + 交叉编译目标
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,7 +39,7 @@ jobs:
         working-directory: webui
         run: npm install
 
-      # 4. 安装 Clang (非 GCC)
+      # 4. 安装 Clang
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
@@ -42,21 +53,30 @@ jobs:
           ndk-version: r27c
           add-to-path: false
 
-      # 6. 配置 ANDROID_NDK_HOME 环境变量
+      # 6. 配置 ANDROID_NDK_HOME
       - name: Export ANDROID_NDK_HOME
         run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
 
-      # 7. 在仓库根目录运行 make (默认目标)
+      # 7. 运行 make
       - name: Run make
-        run: make
+        run: make ZIP_LEVEL=${{ inputs.zip_level }}
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
 
-      # 8. 上传产物 package-arm64.zip
-      - name: Upload artifact
+      # 8. 上传产物（按 ZIP_LEVEL 区分）
+      - name: Upload directory artifact
+        if: inputs.zip_level == 'no'
         uses: actions/upload-artifact@v4
         with:
           name: package-arm64
-          path: package-arm64.zip
+          path: outputs/package-arm64
+          if-no-files-found: error
+
+      - name: Upload zip artifact
+        if: inputs.zip_level != 'no'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-arm64
+          path: outputs/package-arm64.zip
           if-no-files-found: error
