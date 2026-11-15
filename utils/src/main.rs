@@ -202,18 +202,25 @@ fn animation_zip(moddir: &Path, id: &str) -> PathBuf {
     moddir.join(ANIM_DIR).join(id).join("bootanimation.zip")
 }
 
-fn detect_system_animation() -> Option<String> {
+/// 返回 (系统动画路径, 是否为 ColorOS 路径)
+/// 探测顺序与挂载时完全一致：先找 AOSP 路径，再找 ColorOS 路径
+fn detect_system_animation_ex() -> Option<(String, bool)> {
     for p in SYSTEM_CANDIDATES {
         if Path::new(p).exists() {
-            return Some(p.to_string());
+            return Some((p.to_string(), false));
         }
     }
     for p in COLOROS_CANDIDATES {
         if Path::new(p).exists() {
-            return Some(p.to_string());
+            return Some((p.to_string(), true));
         }
     }
     None
+}
+
+/// 保留原接口，内部转调
+fn detect_system_animation() -> Option<String> {
+    detect_system_animation_ex().map(|(p, _)| p)
 }
 
 fn dark_animation_path(sys: &str) -> Option<String> {
@@ -222,7 +229,7 @@ fn dark_animation_path(sys: &str) -> Option<String> {
 }
 
 // ============================================================
-// bind mount 封装（rustix mount 不接受 Option）
+// bind mount 封装
 // ============================================================
 fn bind_mount(src: &Path, dst: &Path) -> Result<(), String> {
     mount(src, dst, "", MountFlags::BIND, "")
@@ -237,8 +244,6 @@ fn bind_unmount(dst: &Path) -> Result<(), String> {
 // ============================================================
 // 动画枚举 / 校验
 // ============================================================
-/// 扫描 bootanimations/，只返回含合法 info.json 的动画
-/// 返回 (id, info_json_value)，按 id 字典序
 fn scan_animations(moddir: &Path) -> Vec<(String, serde_json::Value)> {
     let dir = moddir.join(ANIM_DIR);
     let mut out = Vec::new();
@@ -266,8 +271,6 @@ fn scan_animations(moddir: &Path) -> Vec<(String, serde_json::Value)> {
     out
 }
 
-/// 判断某个 id 是否是合法动画：
-/// 目录存在 + info.json 可解析且 id 一致 + bootanimation.zip 存在
 fn is_valid_animation(moddir: &Path, id: &str) -> bool {
     let base = moddir.join(ANIM_DIR).join(id);
     if !base.is_dir() {
@@ -364,6 +367,7 @@ struct RevertData {
 #[derive(Serialize)]
 struct StatusData {
     system_path: Option<String>,
+    system_format: Option<String>, // "aosp" / "coloros"
     animation_id: Option<String>,
     module_file_exists: bool,
     main_mounted: bool,
@@ -399,6 +403,7 @@ struct ApplyTempData {
 
 #[derive(Serialize)]
 struct InstallData {
+    system_format: String, // "aosp" / "coloros"
     installed: Vec<String>,
     updated: Vec<String>,
     skipped: Vec<String>,
@@ -866,7 +871,12 @@ fn revert(flags: &GlobalFlags) -> Result<(), String> {
 // status
 // ============================================================
 fn status(flags: &GlobalFlags) -> Result<(), String> {
-    let sys = detect_system_animation();
+    let detected = detect_system_animation_ex();
+    let sys = detected.as_ref().map(|(p, _)| p.clone());
+    let format = detected.as_ref().map(|(_, is_oppo)| {
+        if *is_oppo { "coloros".to_string() } else { "aosp".to_string() }
+    });
+
     let moddir = mod_dir();
     let id = read_boot_id(&moddir).unwrap_or(None);
 
@@ -893,6 +903,7 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
 
     let data = StatusData {
         system_path: sys.clone(),
+        system_format: format.clone(),
         animation_id: id.clone(),
         module_file_exists: module_exists,
         main_mounted,
@@ -910,6 +921,10 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
         let l_sys = match detect_lang() {
             Lang::Zh => "系统动画路径",
             Lang::En => "system_path",
+        };
+        let l_fmt = match detect_lang() {
+            Lang::Zh => "系统格式",
+            Lang::En => "system_format",
         };
         let l_id = match detect_lang() {
             Lang::Zh => "配置动画 ID",
@@ -931,6 +946,7 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
             Lang::Zh => "(未检测到)",
             Lang::En => "(not found)",
         });
+        let fmt_str = format.as_deref().unwrap_or("(unknown)");
         let id_str = id.as_deref().unwrap_or(match detect_lang() {
             Lang::Zh => "(未设置)",
             Lang::En => "(not set)",
@@ -941,6 +957,7 @@ fn status(flags: &GlobalFlags) -> Result<(), String> {
             String::new()
         };
         eprintln!("{}: {}", l_sys, sys_str);
+        eprintln!("{}: {}", l_fmt, fmt_str);
         eprintln!("{}: {}", l_id, id_str);
         eprintln!("{}: {}", l_mod, module_exists);
         eprintln!("{}: {}{}", l_main, main_mounted, sources_str);
@@ -1184,6 +1201,10 @@ struct Config {
     fps: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    /// ColorOS 专用：水平偏移，缺省为 0
+    offset_x: Option<i32>,
+    /// ColorOS 专用：垂直偏移，缺省为 0
+    offset_y: Option<i32>,
     part: Vec<ConfigPart>,
 }
 
@@ -1244,8 +1265,19 @@ fn detect_resolution() -> (u32, u32) {
     (1080, 2400)
 }
 
-fn generate_desc(config: &Config, w: u32, h: u32) -> String {
-    let mut d = format!("{} {} {}\n", w, h, config.fps.unwrap_or(60));
+/// 生成 desc.txt
+/// - coloros = false：AOSP 格式  `W H FPS`
+/// - coloros = true ：ColorOS 格式 `g W H OFFX OFFY FPS`
+/// offset_x / offset_y 缺省填 0
+fn generate_desc(config: &Config, w: u32, h: u32, coloros: bool) -> String {
+    let fps = config.fps.unwrap_or(60);
+    let mut d = if coloros {
+        let ox = config.offset_x.unwrap_or(0);
+        let oy = config.offset_y.unwrap_or(0);
+        format!("g {} {} {} {} {}\n", w, h, ox, oy, fps)
+    } else {
+        format!("{} {} {}\n", w, h, fps)
+    };
     for p in &config.part {
         d.push_str(&format!(
             "{} {} {} {}\n",
@@ -1280,14 +1312,19 @@ fn add_dir_to_zip(
     Ok(())
 }
 
-fn make_zip(src: &Path, config: &Config, out: &Path) -> Result<(), String> {
+fn make_zip(
+    src: &Path,
+    config: &Config,
+    out: &Path,
+    coloros: bool,
+) -> Result<(), String> {
     let (w, h) = if config.width.is_some() && config.height.is_some() {
         (config.width.unwrap(), config.height.unwrap())
     } else {
         detect_resolution()
     };
 
-    let desc = generate_desc(config, w, h);
+    let desc = generate_desc(config, w, h, coloros);
     let file = fs::File::create(out).map_err(|e| e.to_string())?;
     let mut zip = zip_crate::ZipWriter::new(file);
     let opts = zip_crate::write::FileOptions::default()
@@ -1356,6 +1393,25 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
     );
     log_info(flags, &extract_msg);
     extract_zip(zip_path, &tmp)?;
+
+    // 用与挂载完全一致的路径探测判断当前系统格式
+    let detected = detect_system_animation_ex();
+    let coloros = detected.as_ref().map(|(_, is_oppo)| *is_oppo).unwrap_or(false);
+    let system_format = if coloros { "coloros" } else { "aosp" };
+
+    if coloros {
+        let m = match detect_lang() {
+            Lang::Zh => "检测到 ColorOS 路径，desc.txt 将使用 g 格式",
+            Lang::En => "ColorOS path detected, desc.txt will use g format",
+        };
+        log_info(flags, m);
+    } else {
+        let m = match detect_lang() {
+            Lang::Zh => "检测到 AOSP 路径，desc.txt 将使用标准格式",
+            Lang::En => "AOSP path detected, desc.txt will use standard format",
+        };
+        log_info(flags, m);
+    }
 
     let current_id = read_boot_id(&moddir).unwrap_or(None);
 
@@ -1492,7 +1548,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
             info.id
         );
         log_info(flags, &proc_msg);
-        make_zip(&path, &config, &out_zip)?;
+        make_zip(&path, &config, &out_zip, coloros)?;
 
         fs::copy(&info_path, target.join("info.json")).map_err(|e| e.to_string())?;
 
@@ -1567,7 +1623,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
     }
 
     let msg = format!(
-        "{} {}, {} {}, {} {}",
+        "{} {}, {} {}, {} {} (format: {})",
         match detect_lang() {
             Lang::Zh => "安装",
             Lang::En => "installed",
@@ -1582,7 +1638,8 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
             Lang::Zh => "跳过",
             Lang::En => "skipped",
         },
-        skipped.len()
+        skipped.len(),
+        system_format
     );
     log_info(flags, &msg);
 
@@ -1590,6 +1647,7 @@ fn install(flags: &GlobalFlags, zip_path: &str) -> Result<(), String> {
         json_output(&CmdResult {
             success: true,
             data: Some(InstallData {
+                system_format: system_format.to_string(),
                 installed,
                 updated,
                 skipped,
@@ -1681,8 +1739,8 @@ fn print_help(prog: &str) {
             Lang::En => "set default animation (write file, no mount)",
         },
         install_zh = match detect_lang() {
-            Lang::Zh => "安装动画包",
-            Lang::En => "install animation package",
+            Lang::Zh => "安装动画包（自动识别 AOSP / ColorOS 格式）",
+            Lang::En => "install animation package (auto-detect AOSP / ColorOS)",
         },
         list_zh = match detect_lang() {
             Lang::Zh => "列出所有动画的 ID 和名称",

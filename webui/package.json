@@ -7,6 +7,10 @@
     "start": "parcel src/index.html",
     "build": "parcel build src/index.html --dist-dir outputs --no-content-hash"
   },
+  "dependencies": {
+    "@mdui/icons": "^1.0.4",
+    "mdui": "^2.1.5"
+  },
   "devDependencies": {
     "parcel": "^2.12.0",
     "parcel-namer-rewrite": "^2.16.4"
